@@ -574,6 +574,27 @@ test "trmc transforms the canonical repeat shape and builds correct structure" {
     }
 }
 
+test "trmc leaves the construct rewrite out of a procedure that may suspend" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout.Store.init(allocator, base.target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const peano = try PeanoLayouts.build(&layouts);
+    var b = ProcBuilder.init(&store);
+    defer b.deinit(allocator);
+    const repeat = try buildRepeatProc(allocator, &b, &store, peano);
+    // The mark SuspensionMarks commits when the body reaches a suspending
+    // hosted call; modulo-cons holes would be frame addresses across it.
+    store.getProcSpecPtr(repeat).suspends = .may;
+
+    try lir.Trmc.run(&store, &layouts);
+
+    try std.testing.expect(store.getProcSpecImmediate(repeat).tail_transform != .trmc);
+    try std.testing.expect(try hasSelfCall(allocator, &store, repeat));
+}
+
 test "trmc'd repeat escapes the interpreter call-depth cap" {
     const allocator = std.testing.allocator;
 

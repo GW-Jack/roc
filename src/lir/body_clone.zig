@@ -2027,6 +2027,9 @@ pub fn CallResultFusion(comptime Spec: type) type {
 
             const callee = self.store.getProcSpecImmediate(call.proc);
             if (callee.body == .none or callee.hosted.get() != null or callee.abi != .roc) return false;
+            // A destination is an address in the caller's frame; a callee
+            // that may suspend could write it after that frame is gone.
+            if (callee.suspends == .may) return false;
             if (callee.ret_layout != result_layout) return false;
 
             var chain = std.ArrayList(LocalId).empty;

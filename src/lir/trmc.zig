@@ -88,9 +88,9 @@ pub fn prepareLayouts(store: *const LirStore, layouts: *layout_mod.Store) Resour
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@intCast(index)));
         // Only a procedure that calls itself can be rewritten to thread a
-        // pointer to its result.
+        // pointer to its result, and only one that never suspends.
         if (proc.body != .none and proc.hosted.get() == null and proc.abi == .roc and proc.shapes.self_call and
-            layouts.getLayout(proc.ret_layout).tag == .tag_union)
+            proc.suspends == .never and layouts.getLayout(proc.ret_layout).tag == .tag_union)
         {
             _ = try layouts.insertPtr(proc.ret_layout);
         }
@@ -145,7 +145,9 @@ fn transformProc(
     defer detection.deinit();
     // Ordinary TCE consumes producer facts directly; only constructor
     // rewriting needs the graph walk and its path-specific use analysis.
-    if (layouts.getLayout(proc.ret_layout).tag == .tag_union) {
+    // A procedure that may suspend gets TCE only: modulo-cons holes are
+    // frame addresses (`ptr_alloca`), which a pause would leave dangling.
+    if (proc.suspends == .never and layouts.getLayout(proc.ret_layout).tag == .tag_union) {
         try detection.detect();
         if (detection.bail) scratch.candidates.clearRetainingCapacity();
     }

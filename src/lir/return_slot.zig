@@ -312,6 +312,52 @@ test "return slot creates an explicit ptr-result variant for aggregate call stor
     try std.testing.expectEqual(call, caller_proc.body.get().?);
 }
 
+test "return slot gives no destination variant to a callee that may suspend" {
+    const allocator = std.testing.allocator;
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(allocator, @import("base").target.TargetUsize.native);
+    defer layouts.deinit();
+
+    const aggregate = try testStructLayout(&layouts);
+    const aggregate_ptr = try layouts.insertPtr(aggregate);
+    const callee = try testAggregateCallee(&store, aggregate);
+    // A destination is the caller's frame address; a callee that may
+    // suspend could write it after the caller's frame is gone.
+    store.getProcSpecPtr(callee).suspends = .may;
+
+    const destination = try testLocal(&store, aggregate_ptr);
+    const arg = try testLocal(&store, .u64);
+    const temporary = try testLocal(&store, aggregate);
+    const store_unit = try testLocal(&store, .zst);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = store_unit } }, .test_fixture);
+    const ptr_store = try testLowLevel(&store, store_unit, .ptr_store, &.{ destination, temporary }, ret);
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = temporary,
+        .proc = callee,
+        .args = try store.addLocalSpan(&.{arg}),
+        .next = ptr_store,
+    } }, .test_fixture);
+    _ = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(4),
+        .args = try store.addLocalSpan(&.{ destination, arg }),
+        .frame_locals = try store.addLocalSpan(&.{ destination, arg, temporary, store_unit }),
+        .body = .some(call),
+        .ret_layout = .zst,
+    }, .none);
+    const proc_count = store.procSpecCount();
+
+    try run(&store, &layouts);
+
+    const kept = store.getCFStmtImmediate(call).assign_call;
+    try std.testing.expectEqual(callee, kept.proc);
+    try std.testing.expectEqual(temporary, kept.target);
+    try std.testing.expectEqual(ptr_store, kept.next);
+    try std.testing.expectEqual(proc_count, store.procSpecCount());
+}
+
 test "return slot lowers direct tag return into destination store" {
     const allocator = std.testing.allocator;
     var store = LirStore.init(allocator);

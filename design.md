@@ -33582,8 +33582,17 @@ alone:
 - TRMC does not apply its modulo-cons transformation to such a procedure,
   since its hole pointers are frame addresses (`ptr_alloca`). Plain tail-call
   elimination still applies.
-- No rewrite makes a value maybe-uninitialized (`JoinExtra`'s
+- No value is maybe-uninitialized (`JoinExtra`'s
   `maybe_uninitialized_params`) where it is live across a suspension site.
+  Only LIR construction makes one, from a derived record parser's
+  `uninitialized_payload` loop initializer. A parser's hooks are pure
+  (`->`), so its loop and continuations contain no effectful call and so no
+  site. Later rewrites copy these values or refuse to touch them; none makes
+  a new one. No rewrite needs a check for this; the continuation pass's
+  verifier asserts it.
+- No other rewrite needs a mark. Only TRMC makes `ptr_alloca` slots. A
+  procedure that may suspend contains a call that list-append promotion
+  doesn't recognize, so it is never promoted as an append helper.
 
 A site whose callee is a procedure and whose result the procedure returns
 unchanged (the call's next statement returns its target, directly or by
