@@ -1214,6 +1214,10 @@ pub fn solveWithOptions(
     defer binding.deinit(allocator);
     for (0..store.procSpecCount()) |proc_index| {
         if (solver.pinned.isSet(proc_index)) continue;
+        // A procedure that may suspend can finish after its caller's frame
+        // is gone, so its result is always owned (design.md "The
+        // Continuation Pass").
+        if (store.getProcSpec(@fromBackingInt(@intCast(@as(u32, @intCast(proc_index))))).suspends == .may) continue;
         if (retLenders(&solver, &binding, proc_index)) |lenders| {
             solver.sigs[proc_index].ret_mode = .borrowed;
             solver.sigs[proc_index].ret_lenders = lenders;
@@ -1663,6 +1667,9 @@ fn computeOutcomeRestitution(
             continue;
         }
         if (solution.isPinnedProc(proc_id) and !solution.stability_pinned.isSet(proc_index)) continue;
+        // A resumed procedure returns through its continuations, which no
+        // caller's outcome switch sees, so it offers no restitution.
+        if (proc.suspends == .may) continue;
         const body = proc.arcBody() orelse continue;
         if (layouts.getLayout(proc.ret_layout).tag != .tag_union) continue;
 

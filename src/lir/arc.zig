@@ -3837,6 +3837,8 @@ const Inserter = struct {
         if (self.store.stmtRow(call.data).result_reuse) return false;
         const caller = self.store.getProcSpec(self.current_proc);
         if (caller.hosted.get() != null) return false;
+        // A procedure that may suspend uses no pending cell.
+        if (caller.suspends == .may) return false;
         const joins = self.solution.joinBodiesOf(self.current_source_proc);
         var current: LIR.CFStmtId = call.next;
         // A join body that jumps back to its own join never returns, so more
@@ -3863,6 +3865,8 @@ const Inserter = struct {
     fn dynErasedCallIsDeferred(self: *const Inserter, target: LIR.LocalId, call_next: LIR.CFStmtId) bool {
         const caller = self.store.getProcSpec(self.current_proc);
         if (caller.hosted.get() != null) return false;
+        // A procedure that may suspend uses no pending cell.
+        if (caller.suspends == .may) return false;
         const joins = self.solution.joinBodiesOf(self.current_source_proc);
         var current: LIR.CFStmtId = call_next;
         // A join body that jumps back to its own join never returns, so more
@@ -10063,6 +10067,36 @@ test "ARC transfers erased call ownership from an explicit outer source" {
     return error.MissingErasedCall;
 }
 
+test "ARC defers no erased call in a procedure that may suspend" {
+    // The same tail erased call, deferred in an ordinary procedure, is made
+    // in place in one that may suspend: such a procedure uses no pending
+    // cell (design.md "The Continuation Pass").
+    for ([_]LIR.Suspends{ .never, .may }) |suspends| {
+        var f = try ArcTest.init(testing.allocator);
+        defer f.deinit();
+
+        const erased_callable = try f.layouts.insertErasedCallable();
+        const closure = try f.local(erased_callable);
+        const result = try f.local(.i64);
+        const arg_plan = try f.store.internErasedCallArgsPlan(&f.layouts, &.{});
+        const ret = try f.ret(result);
+        const call = try f.store.addCFStmt(.{ .assign_call_erased = .{
+            .target = result,
+            .data = try f.store.addStmtRow(LIR.ErasedCallData, .{
+                .closure = closure,
+                .args = LIR.LocalSpan.empty(),
+                .arg_plan = arg_plan,
+            }),
+            .next = ret,
+        } }, .test_fixture);
+        const caller = try f.addProc(&.{closure}, call, .i64);
+        f.store.getProcSpecPtr(caller).suspends = suspends;
+
+        const inserted = try insert(&f.store, &f.layouts, .{});
+        try testing.expectEqual(suspends == .never, inserted.deferred_erased_calls);
+    }
+}
+
 test "ARC borrows an erased call's closure that is read after the call" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
@@ -16241,6 +16275,68 @@ test "RC outcome restitution preserves List Str on failure and seeds the success
     }
     try testing.expect(remaining > 0);
     try testing.expectEqual(@as(usize, 0), f.countRc(input, .incref));
+}
+
+test "RC outcome restitution leaves a procedure that may suspend without an outcome variant" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+
+    const try_list = try f.layouts.putTagUnion(&[_]layout_mod.Idx{
+        try f.layouts.ensureZstLayout(),
+        f.list_str,
+    });
+
+    // The shape of the test above, whose callee gets an outcome variant;
+    // here the callee may suspend.
+    const param = try f.local(f.list_str);
+    const choose_success = try f.local(.i64);
+    const changed = try f.local(f.list_str);
+    const callee_result = try f.local(try_list);
+    const success_ret = try f.ret(callee_result);
+    const success_tag = try f.assignTag(callee_result, 1, changed, success_ret);
+    const mutate = try f.store.addCFStmt(.{ .assign_low_level = .{
+        .target = changed,
+        .op = .list_reverse,
+        .rc_effect = try f.store.addRcEffect(LIR.LowLevel.RcEffect.runtimeUniqueness(1)),
+        .args = try f.span(&.{param}),
+        .next = success_tag,
+    } }, .test_fixture);
+    const failure_ret = try f.ret(callee_result);
+    const failure_tag = try f.assignTag(callee_result, 0, null, failure_ret);
+    const callee_body = try f.switchStmt(choose_success, mutate, failure_tag, null);
+    const callee = try f.addProc(&.{ param, choose_success }, callee_body, try_list);
+    f.store.getProcSpecPtr(callee).suspends = .may;
+
+    const item = try f.local(.str);
+    const input = try f.local(f.list_str);
+    const caller_choose = try f.local(.i64);
+    const call_result = try f.local(try_list);
+    const discriminant = try f.local(.u8);
+    const success_value = try f.local(.i64);
+    const failure_value = try f.local(.i64);
+    const caller_success_ret = try f.ret(success_value);
+    const success_body = try f.assignI64(success_value, 1, caller_success_ret);
+    const caller_failure_ret = try f.ret(failure_value);
+    const failure_done = try f.assignI64(failure_value, 0, caller_failure_ret);
+    const failure_body = try f.expectStmt(input, failure_done);
+    const refine = try f.switchStmt(discriminant, success_body, failure_body, null);
+    const read_discriminant = try f.assignDiscriminant(discriminant, call_result, refine);
+    const call = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = call_result,
+        .proc = callee,
+        .args = try f.span(&.{ input, caller_choose }),
+        .next = read_discriminant,
+    } }, .test_fixture);
+    const choose = try f.assignI64(caller_choose, 1, call);
+    const make_input = try f.assignList(input, &.{item}, choose);
+    const caller_body = try f.assignStr(item, "nested", make_input);
+    _ = try f.addProc(&.{}, caller_body, .i64);
+
+    const base_proc_count = f.store.procSpecCount();
+    _ = try insert(&f.store, &f.layouts, .{ .specialize = true });
+
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
+    try testing.expectEqual(callee, f.store.getCFStmtImmediate(call).assign_call.proc);
 }
 
 test "RC emission units: a call demands an outcome-restitution variant within its callee's unit or when its callee's object publishes it" {
