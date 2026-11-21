@@ -33645,8 +33645,9 @@ reads it, and the task. A value is live when some path from the call reads
 it before writing it, and a join's `retained` locals count as read at the
 start of its body. The pass computes
 each site's live values and whether it is a tail site once, from the LIR it
-is given, with the shared read and definition inventories. A hosted site's result is its `RocPoll`, which nothing reads after the
-test; its continuation begins with the read from the slot.
+is given, with the shared read and definition inventories. A hosted site's `RocPoll` is read only by its test; its continuation
+takes the hosted result, which the ready path reads from the slot and the
+resume entry reads from the slot after a pause.
 
 The body of `C(f, k)` is a copy of the code that runs after the call: the
 rest of the statement chain, inside copies of the joins that enclose the
@@ -33661,12 +33662,26 @@ each such call and a loop that runs after a resume runs in constant space;
 any other chain of continuations is no longer than the number of sites in
 `f`.
 
+The construction is exact. `C(f, k)` takes its live values in ascending
+local order, then the task, and returns `f`'s result layout. A copy keeps
+the join identities of `f`, since it is a procedure of its own. The joins
+it declares around the copied code are the enclosing joins of the site
+that the copy can jump to, found by following jumps from the code after
+the call and from each such join's body, and nested as they are in `f`.
+In every copy, the site `j` it stops at stays a call. Its pending edge
+saves `R(f, j)`, the same resume entry `f`'s own site `j` saves, so each
+site of `f` has one continuation and one resume entry however many copies
+reach it. Every procedure the pass makes is marked when the pass recomputes
+the marks at its end.
+
 **Resume entries.** For each such site the pass makes a *resume entry*
 `R(f, k)`: an erased-callable procedure whose capture is the site's live
-values and whose one explicit argument is the task. When the site's callee is
-a procedure, it reads the call's result from the task's result buffer. It
-calls `C(f, k)` with its captures and that result, a tail site, and returns
-the continuation's result through the erased-callable result pointer.
+values other than the call's result, and whose one explicit argument is the
+task. It reads the call's result from where it arrived: the task's result
+buffer when the callee is a procedure, the hosted slot when it is a
+`suspending` hosted procedure. It calls `C(f, k)` with its captures and that
+result, a tail site, and returns the continuation's result through the
+erased-callable result pointer.
 
 **Pending edges.** After each suspension site that is not a tail site, the
 procedure tests whether the call paused, with the paused side cold:
