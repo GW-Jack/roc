@@ -2369,9 +2369,13 @@ fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.I
         );
     }
 
-    // `concurrency` is contextual, so it stays usable as an identifier.
+    // `concurrency` is contextual, so it stays usable as an identifier. It
+    // names the field only when a colon or a mode follows it; anything else,
+    // such as `concurrency = 4`, is left to the statement parser.
     var concurrency: ?Token.Idx = null;
-    if (self.peek() == .LowerIdent and std.mem.eql(u8, self.tokenText(self.pos), "concurrency")) {
+    if (self.peek() == .LowerIdent and (self.peekNext() == .OpColon or self.peekNext() == .UpperIdent) and
+        std.mem.eql(u8, self.tokenText(self.pos), "concurrency"))
+    {
         self.advance();
         self.expect(.OpColon) catch {
             return try self.pushMalformed(AST.Header.Idx, .expected_concurrency_colon, self.pos);

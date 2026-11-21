@@ -33506,9 +33506,11 @@ interpreter and LirImage follow the output without knowing about suspension.
 - **Where the parser accepts them.** `concurrency: <UpperIdent>` is an
   optional platform header field after `hosted` and before `targets`; the
   AST keeps the mode token, and canonicalization decides which modes exist.
-  Tokens can't tell the field from a top-level annotation of a value named
-  `concurrency`, so in that position the field wins; such an annotation
-  placed first in a platform module is reported as an unknown mode.
+  The word names the field only when a colon or a mode follows it, so a
+  binding such as `concurrency = 4` stays a statement. Tokens can't tell the
+  field from a top-level annotation of a value named `concurrency`, so in
+  that position the field wins; such an annotation placed first in a
+  platform module is reported as an unknown mode.
   `suspending` is a marker on a type annotation statement at the top level
   or in an associated block, recognized only when an annotated name follows
   it (`suspending name : ...`); anywhere else the word is an identifier. The
