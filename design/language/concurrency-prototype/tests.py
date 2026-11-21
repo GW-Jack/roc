@@ -2338,6 +2338,45 @@ class SharedVariables(unittest.TestCase):
         upd = procs[shared_mod.update_form("push_or_wait", 1)]
         self.assertNotIn(("dup", "xs"), upd.body.term[2].stmts)
 
+    # A function that can pause, held in a cell: stored by `shared` and taken
+    # out by `read`, and stored by a step's Set and taken out by a step's Keep.
+    CLOSURE_IN_CELL = """
+    (proc job () eff (let v (host slow 1)) (ret v))
+    (proc job2 () eff (let v (host slow 2)) (ret v))
+    (proc install (s g) pure (let z (int 0)) (ret (tag Set z g)))
+    (proc fetch (s) pure (ret (tag Keep s)))
+    (proc main () eff
+      (let c (shared (clo job)))
+      (let f (read c))
+      (let a (callc! f))
+      (let d (shared 0))
+      (let g (clo job2))
+      (do (step install (d) g))
+      (let h (step fetch (d)))
+      (let b (callc! h))
+      (ret (add a b)))
+    """
+
+    def test_a_function_held_in_a_cell_is_called_at_a_suspension_site(self):
+        # The lambda sets follow closures through cells, so under `.lss` each
+        # call of a function taken from a cell is a site: a pause there is
+        # saved, not left as a pending flag after a call that isn't a site.
+        lows = self.build(self.CLOSURE_IN_CELL)
+        low = lows["lss"]
+        self.assertIn("job", low.targets("main", "f"))
+        self.assertIn("job2", low.targets("main", "h"))
+        self.assertEqual(len(everywhere(lows)), 1)
+
+    def test_an_update_can_call_a_helper_with_its_own_parameter_name(self):
+        # The caller's and the helper's frames are equal once the helper has
+        # consumed its parameter; the evaluator pops frames by identity.
+        lows = self.build("""
+        (proc identity (s) pure (ret s))
+        (proc keep_it (s) pure (let x (call identity s)) (ret (tag Set 0 x)))
+        (proc main () eff (let c (shared 5)) (let r (step keep_it (c))) (let v (read c)) (ret (add r v)))
+        """)
+        self.assertEqual(everywhere(lows), {("done", 5)})
+
     def test_static_checks(self):
         cases = {
             "(proc main () eff (let s (shared 1)) (do (defer sv_give (s))) (ret 0))": "ret with 1 deferred",

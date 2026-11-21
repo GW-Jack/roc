@@ -601,7 +601,11 @@ def _pure(prog, heap, pname, args, frames):
                 counts[tm[1]] -= 1
                 raise PureCrash(env[tm[1]], _owned(frames))
     finally:
-        frames.remove(frame)
+        # Frames are a stack: pop this one by identity. Two frames can be
+        # equal, such as a caller and an identity helper it called with the
+        # same parameter name once the helper has consumed its parameter.
+        assert frames[-1] is frame, "pure frames popped out of order"
+        frames.pop()
 
 
 # ---------------------------------------------------------------------------

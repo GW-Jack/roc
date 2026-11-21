@@ -27,6 +27,7 @@ call up (`handed`: the site's value is returned unchanged) or makes it
 from __future__ import annotations
 
 from ir import blocks, expr_vars
+from shared import update_form
 
 SITE_KINDS = ("call", "callc", "host", "await", "next", "recv", "take", "acquire", "step")
 TASK_OPS = ("host", "await", "spawn", "cancel", "group", "next", "spawn_in", "cancel_group", "pair", "send",
@@ -104,14 +105,29 @@ class Lowering:
                                 for a, q in zip(e[2], ps[len(ps) - len(e[2]):]):
                                     changed |= flow((g, q), get(p.name, a))
                                 changed |= flow((p.name, x), ret[g])
-                        elif k in ("tup", "tag", "list", "set", "push", "send", "post"):
+                        elif k in ("tup", "tag", "list", "set", "push", "send", "post", "shared"):
                             for a in expr_vars(e):
                                 n = get(p.name, a)
                                 if not n <= heap:
                                     heap |= n
                                     changed = True
-                        elif k in ("field", "get", "await", "next", "recv", "take"):
+                        elif k in ("field", "get", "await", "next", "recv", "take", "read"):
                             changed |= flow((p.name, x), heap)
+                        elif k in ("step", "defer", "errdefer"):
+                            # The function, as written for probes and as its
+                            # update form for steps, gets each cell's state
+                            # (heap data), then the arguments. The states and
+                            # answer it returns are fields of a tag it builds,
+                            # so they are heap data, and a step's value is too.
+                            f, cells, args = e[1], e[2], e[3]
+                            for g in (f, update_form(f, len(cells))):
+                                ps = prog.procs[g].params
+                                for q in ps[:len(cells)]:
+                                    changed |= flow((g, q), heap)
+                                for a, q in zip(args, ps[len(cells):]):
+                                    changed |= flow((g, q), get(p.name, a))
+                            if k == "step":
+                                changed |= flow((p.name, x), heap)
                         elif k in ("group", "spawn_in"):
                             # The running set runs closures from the plan (in
                             # the heap) or the one given; arrivals are heap data.
