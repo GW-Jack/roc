@@ -2207,6 +2207,36 @@ fn requirePlatformTargets(ctx: *CliCtx, build_env: *const BuildEnv, app_path: []
     return .{ .root_file = root_file, .config = config };
 }
 
+/// Reject a platform whose `concurrency` mode the chosen optimization level
+/// and lowering strategy do not support yet (design.md "What Implements It
+/// First"): `Tasks` runs only on the interpreter under `.lss`. Discovery read
+/// the mode from the platform header, so this runs before any lowering.
+/// `ParallelTasks` is left to checking, which reports it as not yet
+/// implemented.
+fn requireSupportedConcurrency(
+    ctx: *CliCtx,
+    build_env: *const BuildEnv,
+    opt: cli_args.OptLevel,
+    strategy: base.SpecializationStrategy,
+) CliMainError!void {
+    const mode = build_env.getPlatformConcurrencyMode() orelse return;
+    switch (mode) {
+        .none, .parallel_tasks => return,
+        .tasks => {},
+    }
+    const supported = opt == .interpreter and strategy == .lss;
+    if (supported) return;
+    try renderProblem(ctx, .{ .unsupported_concurrency_lowering = .{
+        .mode = "Tasks",
+        .opt = @tagName(opt),
+        .specialize = switch (strategy) {
+            .lss => "yes",
+            .boxy => "no",
+        },
+    } });
+    return error.PlatformNotSupported;
+}
+
 /// The host inputs a shim run links for its selected target, copied out of
 /// the build environment that resolved the platform so they outlive it.
 const RunPlatformLink = struct {
@@ -2747,6 +2777,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
         try discoverRunDependencies(ctx, &build_env, args.path, args.path, &reporter);
 
         const platform = try requirePlatformTargets(ctx, &build_env, args.path);
+        try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
         const selected = try selectRunPlatformTarget(ctx, platform.config, platform.root_file, args.target);
         build_env.setTarget(selected.target);
         build_env.setValidateTargetFilesForSelectedTarget(true);
@@ -10324,6 +10355,7 @@ fn resolveBuildCommandPlatform(
     reporter.end();
 
     const platform = try requirePlatformTargets(ctx, build_env, args.path);
+    try requireSupportedConcurrency(ctx, build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
     const targets_config = platform.config;
     const platform_source = platform.root_file;
     const platform_dir = std.fs.path.dirname(platform_source) orelse ".";
@@ -17298,6 +17330,7 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) CliMainEr
         return err;
     };
     reporter.end();
+    try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
 
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {

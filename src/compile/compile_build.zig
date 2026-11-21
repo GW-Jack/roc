@@ -538,6 +538,16 @@ pub const BuildEnv = struct {
         self.cache_manager = manager;
     }
 
+    /// The selected platform header's `concurrency` mode, read at discovery
+    /// so the CLI can reject an unsupported lowering before checking. Null
+    /// when no platform is selected.
+    pub fn getPlatformConcurrencyMode(self: *const BuildEnv) ?base.ConcurrencyMode {
+        const name = self.selected_platform_package_name orelse return null;
+        const platform = self.packages.get(name) orelse return null;
+        std.debug.assert(platform.kind == .platform);
+        return platform.concurrency_mode;
+    }
+
     pub fn getPlatformTargetsConfig(self: *const BuildEnv) ?targets_config_mod.TargetsConfig {
         const name = self.selected_platform_package_name orelse return null;
         const platform = self.packages.get(name) orelse return null;
@@ -1121,6 +1131,7 @@ pub const BuildEnv = struct {
                 header_info.hosted_symbols = .empty; // Prevent double-free in deinit
                 pkg.targets_config = header_info.targets_config;
                 header_info.targets_config = null; // Prevent double-free in deinit
+                pkg.concurrency_mode = header_info.concurrency_mode;
             }
         }
         if (header_info.kind == .package or header_info.kind == .platform) {
@@ -1497,6 +1508,8 @@ pub const BuildEnv = struct {
         /// The symbol strings of a platform header's `hosted` section.
         hosted_symbols: std.ArrayListUnmanaged([]const u8) = .empty,
         targets_config: ?targets_config_mod.TargetsConfig = null,
+        /// A platform header's `concurrency` mode.
+        concurrency_mode: base.ConcurrencyMode = .none,
 
         fn deinit(self: *Package, gpa: Allocator) void {
             if (self.url) |*url| url.deinit(gpa);
@@ -1534,6 +1547,9 @@ pub const BuildEnv = struct {
         hosted_symbols: std.ArrayListUnmanaged([]const u8) = .empty,
         /// Targets configuration extracted from platform header
         targets_config: ?targets_config_mod.TargetsConfig = null,
+        /// A platform header's `concurrency` mode. An unknown mode name reads
+        /// as `none` here; canonicalization reports it.
+        concurrency_mode: base.ConcurrencyMode = .none,
         /// The file this header was read from, parsed in full.
         parsed: ?DiscoveredParse = null,
 
@@ -1687,6 +1703,10 @@ pub const BuildEnv = struct {
                 for (ast.store.symbolMapEntrySlice(p.hosted)) |entry_idx| {
                     const entry = ast.store.getSymbolMapEntry(entry_idx);
                     try info.hosted_symbols.append(self.gpa, try self.gpa.dupe(u8, ast.resolve(entry.symbol)));
+                }
+
+                if (p.concurrency) |mode| {
+                    info.concurrency_mode = base.ConcurrencyMode.fromHeaderName(ast.resolve(mode)) orelse .none;
                 }
 
                 // Extract targets config from the platform AST
@@ -2050,6 +2070,7 @@ pub const BuildEnv = struct {
                     child_pkg.targets_config = child_info.targets_config;
                     child_info.targets_config = null; // Prevent double-free in deinit
                 }
+                if (package.kind == .platform) child_pkg.concurrency_mode = child_info.concurrency_mode;
             }
 
             if (package.kind == .platform) {

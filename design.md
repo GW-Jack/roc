@@ -33883,7 +33883,8 @@ interpreter. Until the rest exists:
 
 - the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
   with any backend other than the interpreter, as an unsupported option
-  combination;
+  combination. Discovery reads the mode from the platform header, so
+  `roc run`, `roc build` and `roc test` report it before checking starts;
 - checking reports `concurrency: ParallelTasks` as not yet implemented;
 - the continuation pass stops with a not-yet-implemented panic, in every
   build mode, when an erased-callable procedure other than a resume entry or

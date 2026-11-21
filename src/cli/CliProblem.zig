@@ -251,6 +251,15 @@ pub const CliProblem = union(enum) {
         opt: []const u8,
     },
 
+    /// The platform's `concurrency` mode is not supported under the chosen
+    /// optimization level and lowering strategy (design.md "What Implements
+    /// It First").
+    unsupported_concurrency_lowering: struct {
+        mode: []const u8,
+        opt: []const u8,
+        specialize: []const u8,
+    },
+
     /// Compilation produced errors
     compilation_failed: struct {
         path: []const u8,
@@ -490,6 +499,7 @@ pub const CliProblem = union(enum) {
             .build_not_supported_for_headerless,
             .unsupported_default_platform_target,
             .unsupported_opt_level,
+            .unsupported_concurrency_lowering,
             .wasm_maximum_memory_too_large,
             .compilation_failed,
             .unreported_error,
@@ -566,6 +576,7 @@ pub const CliProblem = union(enum) {
             .build_not_supported_for_headerless => |info| try createBuildNotSupportedForHeaderlessReport(allocator, info),
             .unsupported_default_platform_target => |info| try createUnsupportedDefaultPlatformTargetReport(allocator, info),
             .unsupported_opt_level => |info| try createUnsupportedOptLevelReport(allocator, info),
+            .unsupported_concurrency_lowering => |info| try createUnsupportedConcurrencyLoweringReport(allocator, info),
             .wasm_maximum_memory_too_large => |info| try createWasmMaximumMemoryTooLargeReport(allocator, info),
             .compilation_failed => |info| try createCompilationFailedReport(allocator, info),
             .unreported_error => |info| try createUnreportedErrorReport(allocator, info),
@@ -1156,6 +1167,24 @@ fn createUnsupportedOptLevelReport(allocator: Allocator, info: anytype) Allocato
     try report.document.addText(" for compiled builds, or ");
     try report.document.addAnnotated("--opt=interpreter", .emphasized);
     try report.document.addText(" for interpreter builds.");
+
+    return report;
+}
+
+fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytype) Allocator.Error!Report {
+    const headline = try std.fmt.allocPrint(
+        allocator,
+        "This app's platform uses `concurrency: {s}`, which is not supported with --opt={s} --specialize={s} yet.",
+        .{ info.mode, info.opt, info.specialize },
+    );
+    defer allocator.free(headline);
+    var report = try Report.init(allocator, "Concurrency Not Supported Here", headline, .fatal);
+
+    try report.document.addText("For now, a platform with ");
+    try report.document.addAnnotated("concurrency: Tasks", .emphasized);
+    try report.document.addText(" runs only on the interpreter with lambda-set specialization: use ");
+    try report.document.addAnnotated("--opt=interpreter --specialize=yes", .emphasized);
+    try report.document.addText(".");
 
     return report;
 }
@@ -1819,6 +1848,19 @@ test "unsupported_opt_level generates correct report" {
 
     try std.testing.expectEqualStrings("Optimization Mode Not Implemented", report.title);
     try std.testing.expectEqual(Severity.fatal, report.severity);
+}
+
+test "unsupported_concurrency_lowering names the supported options" {
+    const rendered = try renderPlainForTest(.{ .unsupported_concurrency_lowering = .{
+        .mode = "Tasks",
+        .opt = "dev",
+        .specialize = "no",
+    } });
+    defer std.testing.allocator.free(rendered);
+    // The report wraps its lines, so each needle fits within one.
+    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=dev", "--specialize=no", "--opt=interpreter", "--specialize=yes" }) |needle| {
+        try std.testing.expect(std.mem.find(u8, rendered, needle) != null);
+    }
 }
 
 test "no_platform_found generates correct report" {
