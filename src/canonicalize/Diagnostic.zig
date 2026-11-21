@@ -363,6 +363,12 @@ pub const Diagnostic = union(enum) {
     module_name_reserved: struct {
         module_name: Ident.Idx,
     },
+    /// A platform header's `concurrency` field names no mode that exists.
+    /// `region` is the mode name.
+    unknown_concurrency_mode: struct {
+        mode: Ident.Idx,
+        region: Region,
+    },
     default_app_wrong_arity: struct {
         arity: u32,
         region: Region,
@@ -597,6 +603,7 @@ pub const Diagnostic = union(enum) {
             .type_alias_but_needed_nominal => |d| d.region,
             .crash_expects_string => |d| d.region,
             .type_module_has_alias_not_nominal => |d| d.region,
+            .unknown_concurrency_mode => |d| d.region,
             .default_app_wrong_arity => |d| d.region,
             .cannot_import_default_app => |d| d.region,
             .type_name_case_mismatch => |d| d.region,

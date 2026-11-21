@@ -47,6 +47,7 @@ pub const state_discipline = @import("state_discipline.zig");
 pub const SerialStringInterner = @import("SerialStringInterner.zig");
 pub const InternedBytes = @import("InternedBytes.zig");
 pub const SpecializationStrategy = @import("SpecializationStrategy.zig").SpecializationStrategy;
+pub const ConcurrencyMode = @import("ConcurrencyMode.zig").ConcurrencyMode;
 pub const TypeDigestHasher = @import("TypeDigestHasher.zig");
 pub const recursive_digest = @import("recursive_digest.zig");
 /// SHA-256 on the CPU's SHA-256 instructions, interchangeable with `std.crypto.hash.sha2.Sha256`.
@@ -231,6 +232,7 @@ test "base tests" {
     std.testing.refAllDecls(@import("SerialStringInterner.zig"));
     std.testing.refAllDecls(@import("SmallStringInterner.zig"));
     std.testing.refAllDecls(@import("SpecializationStrategy.zig"));
+    std.testing.refAllDecls(@import("ConcurrencyMode.zig"));
     std.testing.refAllDecls(@import("source_utils.zig"));
     std.testing.refAllDecls(@import("stack_overflow.zig"));
     std.testing.refAllDecls(@import("StringLiteral.zig"));

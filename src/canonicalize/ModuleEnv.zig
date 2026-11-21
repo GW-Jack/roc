@@ -1039,6 +1039,9 @@ types: TypeStore,
 module_kind: ModuleKind,
 /// The compiler role of this module, known before header canonicalization.
 module_role: ModuleRole,
+/// A platform module's `concurrency` mode; `none` for every other module and
+/// for a platform whose mode canonicalization rejected.
+concurrency_mode: base.ConcurrencyMode,
 /// All the definitions in the module (populated by canonicalization)
 all_defs: CIR.Def.Span,
 /// Module-global value definitions: top-level values, associated items, and
@@ -1553,6 +1556,7 @@ pub const DeferredImportRef = extern struct {
 pub fn initCIRFields(self: *Self, module_name: []const u8) Allocator.Error!void {
     self.module_kind = .module; // Placeholder - set to actual kind during header canonicalization
     self.module_role = .user;
+    self.concurrency_mode = .none;
     self.all_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.global_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
@@ -1606,6 +1610,7 @@ pub fn initWithSourceDigest(
         .types = try TypeStore.initFromSourceLen(gpa, source_len),
         .module_kind = .module, // Placeholder - set to actual kind during header canonicalization
         .module_role = .user,
+        .concurrency_mode = .none,
         .all_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .global_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
@@ -3490,6 +3495,31 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
 
             break :blk report;
         },
+        .unknown_concurrency_mode => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Unknown Concurrency Mode", "", .runtime_error);
+            const mode = try report.addOwnedString(self.getIdent(data.mode));
+
+            try report.headline.addReflowingText("This platform's ");
+            try report.headline.addInlineCode("concurrency");
+            try report.headline.addReflowingText(" field names ");
+            try report.headline.addInlineCode(mode);
+            try report.headline.addReflowingText(", which is not a concurrency mode.");
+
+            try report.document.addReflowingText("The modes are ");
+            try report.document.addInlineCode("None");
+            try report.document.addReflowingText(", ");
+            try report.document.addInlineCode("Tasks");
+            try report.document.addReflowingText(" and ");
+            try report.document.addInlineCode("ParallelTasks");
+            try report.document.addReflowingText(".");
+            try report.document.addLineBreak();
+
+            try self.addOwnedSourceRegionTo(&report, region_info, .error_highlight, filename);
+
+            break :blk report;
+        },
         .default_app_missing_main => blk: {
             var report = try Report.init(allocator, "Missing `main!` Function", "", .runtime_error);
             try report.headline.addReflowingText("This file has no header and declares no types, so it is a default app, but it has no ");
@@ -4105,6 +4135,7 @@ pub const Serialized = extern struct {
     types: TypeStore.Serialized,
     module_kind: ModuleKind.Serialized,
     module_role: ModuleRole,
+    concurrency_mode: base.ConcurrencyMode,
     all_defs: CIR.Def.Span,
     global_value_defs: CIR.Def.Span,
     top_level_value_defs: CIR.Def.Span,
@@ -4221,6 +4252,7 @@ pub const Serialized = extern struct {
         // Copy simple values directly
         self.module_kind = ModuleKind.Serialized.encode(env.module_kind);
         self.module_role = env.module_role;
+        self.concurrency_mode = env.concurrency_mode;
         self.all_defs = env.all_defs;
         self.global_value_defs = env.global_value_defs;
         self.top_level_value_defs = env.top_level_value_defs;
@@ -4362,6 +4394,7 @@ pub const Serialized = extern struct {
             .types = self.types.deserializeInto(base_addr, gpa, access),
             .module_kind = self.module_kind.decode(),
             .module_role = self.module_role,
+            .concurrency_mode = self.concurrency_mode,
             .all_defs = self.all_defs,
             .global_value_defs = self.global_value_defs,
             .top_level_value_defs = self.top_level_value_defs,

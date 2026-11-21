@@ -4833,6 +4833,7 @@ pub fn canonicalizeFile(
             // Platform provides uses curly braces { main_for_host! } so it's parsed as record fields
             try self.addPlatformProvidesItems(h.provides);
             try self.addPlatformHostedItems(h.hosted);
+            try self.setPlatformConcurrencyMode(h.concurrency);
             // Extract required type signatures for type checking using the new for-clause syntax
             // This stores the types in env.requires_types without creating local definitions
             // Also introduces type aliases (like Model) into the platform's top-level scope
@@ -6284,6 +6285,29 @@ fn checkRocVersionPin(self: *Self, roc_version: ?AST.RecordField.Idx) std.mem.Al
         .running = try self.env.insertIdent(base.Ident.for_text(running)),
         .region = self.parse_ir.tokenizedRegionToRegion(field.region),
     } });
+}
+
+/// Record the platform header's `concurrency` mode. A mode that doesn't exist,
+/// or one not implemented yet, is reported and leaves the mode `none`, so no
+/// later stage sees a mode it would have to guess about.
+fn setPlatformConcurrencyMode(self: *Self, mode_token: ?AST.Token.Idx) std.mem.Allocator.Error!void {
+    const token = mode_token orelse return;
+    const name = self.parse_ir.resolve(token);
+    const region = self.parse_ir.tokenizedRegionToRegion(.{ .start = token, .end = token + 1 });
+    const mode = base.ConcurrencyMode.fromHeaderName(name) orelse {
+        try self.env.pushDiagnostic(.{ .unknown_concurrency_mode = .{
+            .mode = try self.env.insertIdent(base.Ident.for_text(name)),
+            .region = region,
+        } });
+        return;
+    };
+    switch (mode) {
+        .none, .tasks => self.env.concurrency_mode = mode,
+        .parallel_tasks => try self.env.pushDiagnostic(.{ .not_implemented = .{
+            .feature = try self.env.insertString("the ParallelTasks concurrency mode"),
+            .region = region,
+        } }),
+    }
 }
 
 fn createExposedScope(

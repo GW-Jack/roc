@@ -15,9 +15,31 @@ concurrency : U64
 concurrency = 4
 ~~~
 # EXPECTED
-NIL
+UNKNOWN CONCURRENCY MODE - platform_header__concurrency_field_wins.md:7:15:7:18
 # PROBLEMS
-NIL
+~~~clojure
+(reports
+	(report
+		(severity runtime_error)
+		(title "Unknown Concurrency Mode")
+		(region (start 7 15) (end 7 18))
+		(headline
+			(reflow "This platform's ")
+			(annotated code "concurrency")
+			(reflow " field names ")
+			(annotated code "U64")
+			(reflow ", which is not a concurrency mode."))
+		(document
+			(reflow "The modes are ")
+			(annotated code "None")
+			(reflow ", ")
+			(annotated code "Tasks")
+			(reflow " and ")
+			(annotated code "ParallelTasks")
+			(reflow ".")
+			(line-break)
+			(source-region (file "platform_header__concurrency_field_wins.md") (start 7 15) (end 7 18) (annotation error) (line-text "concurrency : U64")))))
+~~~
 # TOKENS
 ~~~zig
 KwPlatform,StringStart,StringPart,StringEnd,

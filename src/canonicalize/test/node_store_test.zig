@@ -985,6 +985,13 @@ test "NodeStore round trip - Diagnostics" {
     });
 
     try diagnostics.append(gpa, CIR.Diagnostic{
+        .unknown_concurrency_mode = .{
+            .mode = rand_ident_idx(),
+            .region = rand_region(),
+        },
+    });
+
+    try diagnostics.append(gpa, CIR.Diagnostic{
         .default_app_wrong_arity = .{
             .arity = 2,
             .region = rand_region(),

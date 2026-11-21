@@ -33485,10 +33485,13 @@ interpreter and LirImage follow the output without knowing about suspension.
 ### Explicit Inputs
 
 - **The platform's `concurrency` field**, `None` (the default when the field
-  is absent), `Tasks` or `ParallelTasks`. Checking records it on the
-  platform's checked output. It changes generated code in modules that never
-  import the platform, so it is part of the compilation key of every unit,
-  like the target.
+  is absent), `Tasks` or `ParallelTasks`. Canonicalization records it on
+  the platform root's module environment and checked output. It changes no
+  checked output, since checking never depends on it, but it changes
+  generated code in modules that never import the platform. Lowering reads
+  it from the platform's checked artifact, and every post-check key that
+  holds the target, such as the `.boxy` unit object key, holds the mode
+  too.
 - **The `suspending` marker** on a hosted function declaration:
 
   ```roc
@@ -33518,6 +33521,24 @@ interpreter and LirImage follow the output without knowing about suspension.
   whether that annotation is a hosted `=>` declaration.
 - **Function types.** Roc has no effect polymorphism, so a pure procedure can
   never reach a suspension site.
+
+Checking makes both inputs exact before anything later reads them:
+
+- A mode other than the three is an unknown-mode error, reported by
+  canonicalization at the mode token. `ParallelTasks` is reported there too,
+  as not yet implemented, until shared counts exist; neither error leaves
+  a mode for later stages to guess at, and the platform's recorded mode is
+  `None` after either.
+- Canonicalization keeps the marker on the annotation-only definition it
+  makes. The hosted transform copies it onto the hosted lambda, and the
+  checked hosted procedure table carries it, so the marker is never read
+  from syntax again.
+- The checker reports `suspending` on an annotation that does not become a
+  hosted procedure (a definition with a body, or one outside the platform
+  package), on a hosted procedure whose type is not `=>`, and on any hosted
+  procedure of a platform whose mode is not `Tasks`. The last check runs
+  with the platform root's hosted section check, after the platform's type
+  modules.
 
 With `concurrency: None` every hosted call completes before it returns, no
 procedure may suspend, and none of the passes below changes anything.
