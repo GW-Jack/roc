@@ -2,17 +2,19 @@
 //!
 //! For every procedure that may suspend, this gives the procedure the task
 //! as a hidden argument, passes it at every suspension site, and makes a
-//! continuation procedure `C(f, k)` for every site `k` that is not a tail
-//! site. A continuation is a copy of the code after its call, inside copies
-//! of the enclosing joins that code can jump to, stopped at every later
-//! site by a tail call to that site's continuation.
-//!
-//! Pending edges and resume entries, which make the continuations
-//! reachable, are added on top of this.
+//! continuation procedure `C(f, k)` and a resume entry `R(f, k)` for every
+//! site `k` that is not a tail site. A continuation is a copy of the code
+//! after its call, inside copies of the enclosing joins that code can jump
+//! to, stopped at every later site by a tail call to that site's
+//! continuation. Every occurrence of a site that is not a tail site, in its
+//! procedure and in the copies, gets a pending edge that saves the site's
+//! resume entry and returns. Each `suspending` hosted procedure takes the
+//! host's shape: the task and a result pointer first, a `RocPoll` result.
 
 const std = @import("std");
 const collections = @import("collections");
 const core = @import("lir_core");
+const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
 const ContinuationSites = @import("continuation_sites.zig");
 const SuspensionMarks = @import("suspension_marks.zig");
@@ -25,11 +27,23 @@ const CFStmtId = LIR.CFStmtId;
 const LocalId = LIR.LocalId;
 const ProcId = LIR.LirProcSpecId;
 
+/// The `RocPoll` value a `suspending` hosted procedure returns when it
+/// finished; every other value means it is pending (design.md "Host
+/// Contract").
+const roc_ready: u64 = 0;
+
 /// What the pass knows about one site of the procedure that contains it.
 const SiteInfo = struct {
     live_after: []const LocalId,
-    /// The site's continuation, or null for a tail site.
+    /// The call's target in the procedure that contains the site.
+    target: LocalId,
+    hosted: bool,
+    /// The site's continuation and resume entry, or null for a tail site.
     continuation: ?ProcId,
+    resume_entry: ?ProcId,
+    capture_layout: layout.Idx,
+    on_drop: LIR.ErasedCallableOnDrop,
+    slot_drop: LIR.ErasedCallableOnDrop,
 };
 
 const ProcPlan = struct {
@@ -38,9 +52,11 @@ const ProcPlan = struct {
     task: LocalId,
 };
 
-/// Give every procedure that may suspend its task argument and make the
-/// continuation of each of its sites that is not a tail site.
-pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
+/// Give every procedure that may suspend its task argument, make the
+/// continuation and resume entry of each of its sites that is not a tail
+/// site, add the pending edges, and give `suspending` hosted procedures the
+/// host's shape.
+pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Allocator.Error!void {
     var plans = std.ArrayList(ProcPlan).empty;
     defer {
         for (plans.items) |*plan| plan.sites.deinit();
@@ -79,37 +95,83 @@ pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
         }
     }
 
-    // One placeholder per continuation first, so copies can call any of them.
+    // One placeholder per continuation and resume entry first, so copies
+    // can call and save any of them.
     var infos = collections.DenseMapUnmanaged(CFStmtId, SiteInfo).empty;
     defer infos.deinit(allocator);
+    var hosted_procs = try std.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
+    defer hosted_procs.deinit(allocator);
     for (plans.items) |plan| {
         const source = store.getProcSpecImmediate(plan.proc).*;
         for (plan.sites.sites, 0..) |site, ordinal| {
-            var continuation: ?ProcId = null;
+            const call = store.getCFStmtImmediate(site.call).assign_call;
+            const hosted = isHosted(store, call.proc);
+            if (hosted) hosted_procs.set(@backingInt(call.proc));
+            var info = SiteInfo{
+                .live_after = site.live_after,
+                .target = call.target,
+                .hosted = hosted,
+                .continuation = null,
+                .resume_entry = null,
+                .capture_layout = .zst,
+                .on_drop = .none,
+                .slot_drop = .none,
+            };
             if (!site.tail) {
                 var key: [4]u8 = undefined;
                 std.mem.writeInt(u32, &key, @intCast(ordinal), .little);
-                continuation = try store.addProcSpec(.{
+                info.continuation = try store.addProcSpec(.{
                     .name = store.freshSyntheticSymbol(),
                     .identity = source.identity.derived("continuation", &key),
                     .args = .empty(),
                     .ret_layout = source.ret_layout,
                 }, store.procLoc(plan.proc));
-                try store.copyProcDebugInfo(continuation.?, plan.proc);
+                try store.copyProcDebugInfo(info.continuation.?, plan.proc);
+                info.resume_entry = try store.addProcSpec(.{
+                    .name = store.freshSyntheticSymbol(),
+                    .identity = source.identity.derived("resume", &key),
+                    .args = .empty(),
+                    .ret_layout = source.ret_layout,
+                    .abi = .erased_callable,
+                }, store.procLoc(plan.proc));
+                try store.copyProcDebugInfo(info.resume_entry.?, plan.proc);
+                info.capture_layout = try captureLayout(allocator, store, layouts, site.live_after, call.target);
+                info.on_drop = hostDrop(layouts, info.capture_layout);
+                if (hosted) info.slot_drop = hostDrop(layouts, store.getLocal(call.target).layout_idx);
             }
-            try infos.put(allocator, site.call, .{ .live_after = site.live_after, .continuation = continuation });
+            try infos.put(allocator, site.call, info);
         }
     }
 
+    // The copies first, from bodies without edges.
     for (plans.items) |plan| {
         var scopes = try JoinScopes.build(allocator, store, store.getProcSpecImmediate(plan.proc).body.get().?);
         defer scopes.deinit();
         for (plan.sites.sites) |site| {
             const info = infos.get(site.call).?;
             const continuation = info.continuation orelse continue;
-            try buildContinuation(allocator, store, &infos, &scopes, plan, site, continuation);
+            try buildContinuation(allocator, store, layouts, &infos, &scopes, plan, site, continuation);
         }
     }
+
+    for (plans.items) |plan| {
+        var sink = FrameSink{ .store = store };
+        defer sink.locals.deinit(store.allocator);
+        for (plan.sites.sites) |site| {
+            const info = infos.get(site.call).?;
+            if (info.continuation == null) continue;
+            try rewriteSite(store, layouts, &sink, info, plan.task, site.call);
+        }
+        for (sink.locals.items) |local| try appendLocal(store, &store.getProcSpecPtr(plan.proc).frame_locals, local);
+        for (plan.sites.sites) |site| {
+            const info = infos.get(site.call).?;
+            if (info.continuation == null) continue;
+            try buildResumeEntry(allocator, store, layouts, info, store.stmtOrigin(site.call));
+        }
+    }
+
+    var hosted_iter = hosted_procs.iterator(.{});
+    while (hosted_iter.next()) |index| try hostShape(store, layouts, @fromBackingInt(@intCast(index)));
 
     try SuspensionMarks.run(allocator, store);
 }
@@ -119,12 +181,266 @@ fn isHosted(store: *const LirStore, proc: ProcId) bool {
 }
 
 fn appendLocal(store: *LirStore, span: *LIR.LocalSpan, local: LocalId) Allocator.Error!void {
-    const old = store.getLocalSpan(span.*);
-    var locals = try std.ArrayList(LocalId).initCapacity(store.allocator, GuardedList.borrowLen(old) + 1);
+    try spliceLocals(store, span, &.{}, &.{local});
+}
+
+/// Replace `span` with `before`, then its locals, then `after`.
+fn spliceLocals(store: *LirStore, span: *LIR.LocalSpan, before: []const LocalId, after: []const LocalId) Allocator.Error!void {
+    const old_len = GuardedList.borrowLen(store.getLocalSpan(span.*));
+    var locals = try std.ArrayList(LocalId).initCapacity(store.allocator, before.len + old_len + after.len);
     defer locals.deinit(store.allocator);
-    for (0..GuardedList.borrowLen(old)) |i| locals.appendAssumeCapacity(GuardedList.at(store.getLocalSpan(span.*), i));
-    locals.appendAssumeCapacity(local);
+    locals.appendSliceAssumeCapacity(before);
+    for (0..old_len) |i| locals.appendAssumeCapacity(GuardedList.at(store.getLocalSpan(span.*), i));
+    locals.appendSliceAssumeCapacity(after);
     span.* = try store.addLocalSpan(locals.items);
+}
+
+/// The `host_drop` RC helper of `layout_idx`, or `none` when it does
+/// nothing.
+fn hostDrop(layouts: *const layout.Store, layout_idx: layout.Idx) LIR.ErasedCallableOnDrop {
+    const key = layout.RcHelper{ .op = .host_drop, .layout_idx = layout_idx };
+    if (layouts.rcHelperPlan(key) == .noop) return .none;
+    return .{ .rc_helper = key };
+}
+
+/// The struct of the saved values' layouts, in the order they are live:
+/// every value live after the site but its result.
+fn captureLayout(allocator: Allocator, store: *const LirStore, layouts: *layout.Store, live_after: []const LocalId, target: LocalId) Allocator.Error!layout.Idx {
+    var fields = std.ArrayList(layout.StructField).empty;
+    defer fields.deinit(allocator);
+    for (live_after) |live| {
+        if (live == target) continue;
+        try fields.append(allocator, .{ .index = @intCast(fields.items.len), .layout = store.getLocal(live).layout_idx });
+    }
+    return layouts.putStructFields(fields.items);
+}
+
+/// Where a site's new locals go: the cloner's when it is in a copy, the
+/// procedure's frame when it is in the procedure itself.
+const FrameSink = struct {
+    store: *LirStore,
+    locals: std.ArrayList(LocalId) = .empty,
+
+    fn newLocal(self: *FrameSink, layout_idx: layout.Idx) Allocator.Error!LocalId {
+        const local = try self.store.addLocal(.{ .layout_idx = layout_idx });
+        try self.locals.append(self.store.allocator, local);
+        return local;
+    }
+};
+
+/// A copy's new locals are the cloner's.
+fn CloneSink(comptime Cloner: type) type {
+    return struct {
+        cloner: Cloner,
+
+        fn newLocal(self: @This(), layout_idx: layout.Idx) Allocator.Error!LocalId {
+            return self.cloner.addTemp(layout_idx);
+        }
+    };
+}
+
+/// One occurrence of a site, in the locals of the procedure that holds it.
+const Occurrence = struct {
+    task: LocalId,
+    target: LocalId,
+    /// The site's live values, in the order of `SiteInfo.live_after`.
+    live: []const LocalId,
+    /// The call, without the task at a hosted site.
+    proc: ProcId,
+    args: LIR.LocalSpan,
+    extra: LIR.StmtRowId(LIR.CallExtra),
+};
+
+/// `suspend_save task R(f, k) [saved]; suspend_return`, where the saved
+/// values are the live ones other than the call's result.
+fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+    var saved = try std.ArrayList(LocalId).initCapacity(store.allocator, occurrence.live.len);
+    defer saved.deinit(store.allocator);
+    for (occurrence.live) |live| {
+        if (live != occurrence.target) saved.appendAssumeCapacity(live);
+    }
+    const ret = try store.addCFStmt(.{ .suspend_return = {} }, origin);
+    return store.addCFStmt(.{ .suspend_save = .{
+        .task = occurrence.task,
+        .data = try store.addStmtRow(LIR.SuspendSaveData, .{
+            .proc = info.resume_entry.?,
+            .saved = try store.addLocalSpan(saved.items),
+            .capture_layout = info.capture_layout,
+            .on_drop = info.on_drop,
+            .slot_drop = info.slot_drop,
+        }),
+        .next = ret,
+    } }, origin);
+}
+
+/// The statement that starts an occurrence of a site that is not a tail
+/// site, with `ready` as the code that runs when nothing paused. A
+/// procedure site keeps its call and tests the pending flag after it; a
+/// hosted site reads the slot's address, calls the host, and branches on
+/// the `RocPoll`.
+fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteInfo, occurrence: Occurrence, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!LIR.CFStmt {
+    const edge = try pendingEdge(store, info, occurrence, origin);
+    if (!info.hosted) {
+        const ready_flag = try sink.newLocal(.bool);
+        const test_stmt = try store.addCFStmt(.{ .switch_initialized_payload = .{
+            .cond = ready_flag,
+            .payload = occurrence.target,
+            .uninitialized_is_cold = true,
+            .initialized_branch = ready,
+            .uninitialized_branch = edge,
+        } }, origin);
+        const read = try store.addLowLevelStmt(ready_flag, .task_ready, &.{occurrence.task}, test_stmt, origin);
+        return .{ .assign_call = .{
+            .target = occurrence.target,
+            .proc = occurrence.proc,
+            .args = occurrence.args,
+            .extra = occurrence.extra,
+            .next = read,
+        } };
+    }
+
+    const result_layout = store.getLocal(occurrence.target).layout_idx;
+    const slot = try sink.newLocal(try layouts.insertPtr(result_layout));
+    const poll = try sink.newLocal(.u32);
+    const unit = try sink.newLocal(.zst);
+    const pending = try store.addLowLevelStmt(unit, .task_set_pending, &.{occurrence.task}, edge, origin);
+    const load = try store.addLowLevelStmt(occurrence.target, .ptr_load, &.{slot}, ready, origin);
+    const branch = try store.addCFStmt(.{ .switch_stmt = .{
+        .cond = poll,
+        .branches = try store.addCFSwitchBranches(&.{.{ .value = roc_ready, .body = load }}),
+        .default_branch = pending,
+        .default_is_cold = true,
+    } }, origin);
+    var args = try std.ArrayList(LocalId).initCapacity(store.allocator, 2 + GuardedList.borrowLen(store.getLocalSpan(occurrence.args)));
+    defer args.deinit(store.allocator);
+    args.appendSliceAssumeCapacity(&.{ occurrence.task, slot });
+    for (0..GuardedList.borrowLen(store.getLocalSpan(occurrence.args))) |i| args.appendAssumeCapacity(GuardedList.at(store.getLocalSpan(occurrence.args), i));
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = poll,
+        .proc = occurrence.proc,
+        .args = try store.addLocalSpan(args.items),
+        .extra = occurrence.extra,
+        .next = branch,
+    } }, origin);
+    return .{ .assign_low_level = .{
+        .target = slot,
+        .op = .task_hosted_slot,
+        .rc_effect = try store.addRcEffect(LIR.LowLevel.task_hosted_slot.rcEffect()),
+        .args = try store.addLocalSpan(&.{occurrence.task}),
+        .next = call,
+    } };
+}
+
+/// Give a site of the procedure itself its pending edge, in place.
+fn rewriteSite(store: *LirStore, layouts: *layout.Store, sink: *FrameSink, info: SiteInfo, task: LocalId, site: CFStmtId) Allocator.Error!void {
+    const call = store.getCFStmtImmediate(site).assign_call;
+    const origin = store.stmtOrigin(site);
+    const head = try siteHead(store, layouts, sink, info, .{
+        .task = task,
+        .target = call.target,
+        .live = info.live_after,
+        .proc = call.proc,
+        .args = call.args,
+        .extra = call.extra,
+    }, call.next, origin);
+    try store.replaceCFStmt(site, head, origin);
+}
+
+/// `R(f, k)`: load the saved values and the call's result, then call
+/// `C(f, k)` with them and the task.
+fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
+    const entry = info.resume_entry.?;
+    const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    const Fresh = struct {
+        store: *LirStore,
+        frame: *std.ArrayList(LocalId),
+        allocator: Allocator,
+        fn local(self: @This(), layout_idx: layout.Idx) Allocator.Error!LocalId {
+            const id = try self.store.addLocal(.{ .layout_idx = layout_idx });
+            try self.frame.append(self.allocator, id);
+            return id;
+        }
+    };
+    const fresh = Fresh{ .store = store, .frame = &frame, .allocator = allocator };
+
+    const task = try fresh.local(.opaque_ptr);
+    const capture = try fresh.local(.opaque_ptr);
+    const reuse = try fresh.local(try layouts.insertErasedCallable());
+    const result_layout = store.getLocal(info.target).layout_idx;
+    const result = try fresh.local(result_layout);
+    const address = try fresh.local(try layouts.insertPtr(result_layout));
+    const value = try fresh.local(ret_layout);
+
+    var fields = std.ArrayList(LocalId).empty;
+    defer fields.deinit(allocator);
+    var call_args = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
+    defer call_args.deinit(allocator);
+    for (info.live_after) |live| {
+        if (live == info.target) {
+            call_args.appendAssumeCapacity(result);
+        } else {
+            const field = try fresh.local(store.getLocal(live).layout_idx);
+            try fields.append(allocator, field);
+            call_args.appendAssumeCapacity(field);
+        }
+    }
+    call_args.appendAssumeCapacity(task);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = value,
+        .proc = info.continuation.?,
+        .args = try store.addLocalSpan(call_args.items),
+        .next = ret,
+    } }, origin);
+    const load = try store.addLowLevelStmt(result, .ptr_load, &.{address}, call, origin);
+    var head = try store.addLowLevelStmt(address, if (info.hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
+    if (fields.items.len > 0) {
+        if (info.capture_layout == .zst) {
+            // Every saved value is zero-sized, so there is no capture to read.
+            var index = fields.items.len;
+            while (index > 0) {
+                index -= 1;
+                head = try store.addCFStmt(.{ .assign_struct = .{ .target = fields.items[index], .fields = .empty(), .next = head } }, origin);
+            }
+        } else {
+            const record = try fresh.local(info.capture_layout);
+            var index = fields.items.len;
+            while (index > 0) {
+                index -= 1;
+                head = try store.addCFStmt(.{ .assign_ref = .{ .target = fields.items[index], .op = LIR.RefOp.field(record, @intCast(index)), .next = head } }, origin);
+            }
+            head = try store.addLowLevelStmt(record, .erased_capture_load, &.{ capture, reuse }, head, origin);
+        }
+    }
+
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const spec = store.getProcSpecPtr(entry);
+    spec.args = try store.addLocalSpan(&.{ task, capture, reuse });
+    spec.frame_locals = try store.addLocalSpan(frame.items);
+    spec.body = .some(head);
+    spec.erased_capture_arg = .some(capture);
+    spec.erased_reuse_arg = .some(reuse);
+    spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
+    spec.shapes = spec.shapes.merged(store.shapes);
+}
+
+/// Give a `suspending` hosted procedure the host's shape: the task and a
+/// pointer to its result before its explicit arguments, and a `RocPoll`
+/// result.
+fn hostShape(store: *LirStore, layouts: *layout.Store, proc: ProcId) Allocator.Error!void {
+    const result_layout = store.getProcSpecImmediate(proc).ret_layout;
+    const task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const out = try store.addLocal(.{ .layout_idx = try layouts.insertPtr(result_layout) });
+    const spec = store.getProcSpecPtr(proc);
+    try spliceLocals(store, &spec.args, &.{ task, out }, &.{});
+    store.getProcSpecPtr(proc).ret_layout = .u32;
+}
+
+fn localLessThan(_: void, lhs: LocalId, rhs: LocalId) bool {
+    return @backingInt(lhs) < @backingInt(rhs);
 }
 
 /// For every statement of a body, the joins in whose body or remainder it
@@ -229,8 +545,11 @@ const JoinScopes = struct {
 /// targets it copies.
 const ContinuationRewriter = struct {
     allocator: Allocator,
+    layouts: *layout.Store,
     infos: *const collections.DenseMapUnmanaged(CFStmtId, SiteInfo),
-    ret_layout: @import("layout").Idx,
+    ret_layout: layout.Idx,
+    /// The task of the procedure being copied.
+    task: LocalId,
     jump_targets: std.ArrayList(LIR.JoinPointId) = .empty,
 
     pub fn interceptStmt(self: *ContinuationRewriter, cloner: anytype, old_id: CFStmtId, stmt: LIR.CFStmt, origin: LIR.StmtOrigin) Allocator.Error!body_clone.Intercept {
@@ -238,28 +557,34 @@ const ContinuationRewriter = struct {
             .assign_call => |call| {
                 const info = self.infos.get(old_id) orelse return .none;
                 const continuation = info.continuation orelse return .none;
+                const task = try cloner.mapLocal(self.task);
+                var live = try std.ArrayList(LocalId).initCapacity(self.allocator, info.live_after.len);
+                defer live.deinit(self.allocator);
+                for (info.live_after) |local| live.appendAssumeCapacity(try cloner.mapLocal(local));
+
+                // Ready: `r = C(f, j)(live..., task); ret r`.
                 const result = try cloner.addTemp(self.ret_layout);
                 const ret = try cloner.store.addCFStmt(.{ .ret = .{ .value = result } }, origin);
-                var args = try std.ArrayList(LocalId).initCapacity(self.allocator, info.live_after.len + 1);
+                var args = try std.ArrayList(LocalId).initCapacity(self.allocator, live.items.len + 1);
                 defer args.deinit(self.allocator);
-                for (info.live_after) |live| args.appendAssumeCapacity(try cloner.mapLocal(live));
-                // The call passes the task last; the continuation takes it
-                // last too.
-                const call_args = cloner.store.getLocalSpan(call.args);
-                args.appendAssumeCapacity(try cloner.mapLocal(GuardedList.at(call_args, GuardedList.borrowLen(call_args) - 1)));
+                args.appendSliceAssumeCapacity(live.items);
+                args.appendAssumeCapacity(task);
                 const tail = try cloner.store.addCFStmt(.{ .assign_call = .{
                     .target = result,
                     .proc = continuation,
                     .args = try cloner.store.addLocalSpan(args.items),
                     .next = ret,
                 } }, origin);
-                return .{ .done = try cloner.store.addCFStmt(.{ .assign_call = .{
+
+                const head = try siteHead(cloner.store, self.layouts, CloneSink(@TypeOf(cloner)){ .cloner = cloner }, info, .{
+                    .task = task,
                     .target = try cloner.mapLocal(call.target),
+                    .live = live.items,
                     .proc = call.proc,
                     .args = try cloner.mapLocalSpan(call.args),
                     .extra = try cloner.mapCallExtra(call.extra),
-                    .next = tail,
-                } }, origin) };
+                }, tail, origin);
+                return .{ .done = try cloner.store.addCFStmt(head, origin) };
             },
             .jump => |jump| {
                 try self.jump_targets.append(self.allocator, jump.target);
@@ -304,6 +629,7 @@ const ContinuationRewriter = struct {
 fn buildContinuation(
     allocator: Allocator,
     store: *LirStore,
+    layouts: *layout.Store,
     infos: *const collections.DenseMapUnmanaged(CFStmtId, SiteInfo),
     scopes: *const JoinScopes,
     plan: ProcPlan,
@@ -313,8 +639,10 @@ fn buildContinuation(
     const ret_layout = store.getProcSpecImmediate(plan.proc).ret_layout;
     var cloner = try body_clone.BodyCloner(ContinuationRewriter).initWithAllocator(store, .{
         .allocator = allocator,
+        .layouts = layouts,
         .infos = infos,
         .ret_layout = ret_layout,
+        .task = plan.task,
     }, allocator);
     defer cloner.deinit();
     defer cloner.rewriter.jump_targets.deinit(allocator);
@@ -384,11 +712,14 @@ const testing = std.testing;
 
 const Fixture = struct {
     store: LirStore,
+    layouts: layout.Store,
     seed: ProcId,
 
     fn init() Allocator.Error!Fixture {
         var store = LirStore.init(testing.allocator);
         errdefer store.deinit();
+        var layouts = try layout.Store.init(testing.allocator, .u64);
+        errdefer layouts.deinit();
         const seed = try store.addProcSpec(.{
             .name = store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(1),
@@ -397,10 +728,11 @@ const Fixture = struct {
             .external = true,
             .suspends = .may,
         }, .none);
-        return .{ .store = store, .seed = seed };
+        return .{ .store = store, .layouts = layouts, .seed = seed };
     }
 
     fn deinit(self: *Fixture) void {
+        self.layouts.deinit();
         self.store.deinit();
     }
 
@@ -457,7 +789,7 @@ test "without a procedure that may suspend nothing changes" {
     const ret = try f.stmt(.{ .ret = .{ .value = t } });
     const p = try f.addProc(&.{}, &.{t}, try f.callSeed(t, ret));
     const count = f.store.procSpecCount();
-    try run(testing.allocator, &f.store);
+    try run(testing.allocator, &f.store, &f.layouts);
     try testing.expectEqual(count, f.store.procSpecCount());
     try testing.expectEqual(@as(usize, 0), f.store.getLocalSpan(f.spec(p).args).len);
 }
@@ -478,7 +810,7 @@ test "a site's continuation takes its live values and the task and copies the co
     const p = try f.addProc(&.{ x, y }, &.{ x, y, t, s, u }, first);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store);
+    try run(testing.allocator, &f.store, &f.layouts);
 
     // f gains the task after its explicit arguments and passes it at both sites.
     const f_args = try f.locals(f.spec(p).args);
@@ -492,8 +824,9 @@ test "a site's continuation takes its live values and the task and copies the co
         try testing.expectEqualSlices(LocalId, &.{task}, site_args);
     }
 
-    // Only the first site has a continuation; the second is a tail site.
-    try testing.expectEqual(count + 1, f.store.procSpecCount());
+    // Only the first site has a continuation and resume entry; the second
+    // is a tail site.
+    try testing.expectEqual(count + 2, f.store.procSpecCount());
     const c: ProcId = @fromBackingInt(@intCast(count));
     try testing.expectEqual(LIR.Suspends.may, f.spec(c).suspends);
     const c_args = try f.locals(f.spec(c).args);
@@ -535,14 +868,15 @@ test "a site inside a loop gets a continuation that loops back to its own copy" 
     _ = try f.addProc(&.{acc0}, &.{ acc0, acc, t, s }, join);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store);
+    try run(testing.allocator, &f.store, &f.layouts);
 
-    try testing.expectEqual(count + 1, f.store.procSpecCount());
+    try testing.expectEqual(count + 2, f.store.procSpecCount());
     const c: ProcId = @fromBackingInt(@intCast(count));
     const c_args = try f.locals(f.spec(c).args);
     defer testing.allocator.free(c_args);
     try testing.expectEqual(@as(usize, 3), c_args.len); // acc, t, task
-    // C = join L(acc') { t' = seed(task'); r = C(acc', t', task'); ret r } in { s' = {acc', t'}; acc' = t'; jump L }
+    // C = join L(acc') { t' = seed(task'); <ready test> r = C(acc', t', task'); ret r }
+    //     in { s' = {acc', t'}; acc' = t'; jump L }
     const c_join = f.at(f.spec(c).body.get().?).join;
     try testing.expectEqual(join_id, c_join.id);
     const params = try f.locals(c_join.params);
@@ -551,7 +885,8 @@ test "a site inside a loop gets a continuation that loops back to its own copy" 
     const loop_call = f.at(c_join.body).assign_call;
     try testing.expectEqual(f.seed, loop_call.proc);
     try testing.expectEqual(c_args[1], loop_call.target);
-    const again = f.at(loop_call.next).assign_call;
+    const ready = f.at(f.at(loop_call.next).assign_low_level.next).switch_initialized_payload;
+    const again = f.at(ready.initialized_branch).assign_call;
     try testing.expectEqual(c, again.proc);
     const again_args = try f.locals(again.args);
     defer testing.allocator.free(again_args);
@@ -562,4 +897,180 @@ test "a site inside a loop gets a continuation that loops back to its own copy" 
     try testing.expectEqual(c_args[0], c_rebind.target);
     try testing.expectEqual(c_args[1], c_rebind.value);
     try testing.expectEqual(join_id, f.at(c_rebind.next).jump.target);
+}
+
+/// The statements a pending edge is made of: `suspend_save`, then
+/// `suspend_return`. Returns the save's data.
+fn expectPendingEdge(f: *Fixture, edge: CFStmtId, task: LocalId, resume_entry: ProcId, saved: []const LocalId) (Allocator.Error || error{ TestExpectedEqual, TestUnexpectedResult })!LIR.SuspendSaveData {
+    const save = f.at(edge).suspend_save;
+    try testing.expectEqual(task, save.task);
+    const data = f.store.stmtRow(save.data);
+    try testing.expectEqual(resume_entry, data.proc);
+    const saved_locals = try f.locals(data.saved);
+    defer testing.allocator.free(saved_locals);
+    try testing.expectEqualSlices(LocalId, saved, saved_locals);
+    try testing.expect(f.at(save.next) == .suspend_return);
+    return data;
+}
+
+test "a procedure site tests the pending flag and saves its resume entry on the cold side" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const y = try f.local();
+    const t = try f.local();
+    const s = try f.local();
+    const u = try f.local();
+    // f(y) = t = seed(); s = {t, y}; u = seed(); ret u
+    const ret = try f.stmt(.{ .ret = .{ .value = u } });
+    const second = try f.callSeed(u, ret);
+    const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, y }), .next = second } });
+    const first = try f.callSeed(t, build);
+    const p = try f.addProc(&.{y}, &.{ y, t, s, u }, first);
+    const count = f.store.procSpecCount();
+
+    try run(testing.allocator, &f.store, &f.layouts);
+
+    const r: ProcId = @fromBackingInt(@intCast(count + 1));
+    const f_args = try f.locals(f.spec(p).args);
+    defer testing.allocator.free(f_args);
+    const task = f_args[1];
+
+    // t = seed(task); ready = task_ready(task); switch_initialized_payload ready t
+    const call = f.at(first).assign_call;
+    try testing.expectEqual(t, call.target);
+    const read = f.at(call.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_ready, read.op);
+    const test_stmt = f.at(read.next).switch_initialized_payload;
+    try testing.expectEqual(read.target, test_stmt.cond);
+    try testing.expectEqual(t, test_stmt.payload);
+    try testing.expect(test_stmt.uninitialized_is_cold);
+    try testing.expectEqual(build, test_stmt.initialized_branch);
+    // The cold side saves y, the one live value other than the result.
+    const data = try expectPendingEdge(&f, test_stmt.uninitialized_branch, task, r, &.{y});
+    try testing.expectEqual(f.store.getLocal(read.target).layout_idx, @import("layout").Idx.bool);
+    try testing.expect(data.slot_drop == .none);
+    // The frame holds the new flag.
+    const frame = try f.locals(f.spec(p).frame_locals);
+    defer testing.allocator.free(frame);
+    try testing.expect(std.mem.findScalar(LocalId, frame, read.target) != null);
+    // The tail site has no test.
+    try testing.expect(f.at(second).assign_call.next == ret);
+}
+
+test "a resume entry reads its capture and the result buffer and calls the continuation" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const y = try f.local();
+    const t = try f.local();
+    const s = try f.local();
+    // f(y) = t = seed(); s = {t, y}; ret s  (s is a u64 here; the shape is what matters)
+    const ret = try f.stmt(.{ .ret = .{ .value = s } });
+    const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, y }), .next = ret } });
+    const first = try f.callSeed(t, build);
+    _ = try f.addProc(&.{y}, &.{ y, t, s }, first);
+    const count = f.store.procSpecCount();
+
+    try run(testing.allocator, &f.store, &f.layouts);
+
+    const c: ProcId = @fromBackingInt(@intCast(count));
+    const r: ProcId = @fromBackingInt(@intCast(count + 1));
+    const spec = f.spec(r);
+    try testing.expectEqual(LIR.ProcAbi.erased_callable, spec.abi);
+    // It may suspend exactly when its continuation may; this one has no
+    // later site.
+    try testing.expectEqual(LIR.Suspends.never, f.spec(c).suspends);
+    try testing.expectEqual(f.spec(c).suspends, spec.suspends);
+    const args = try f.locals(spec.args);
+    defer testing.allocator.free(args);
+    try testing.expectEqual(@as(usize, 3), args.len); // task, capture, reuse
+    try testing.expectEqual(args[1], spec.erased_capture_arg.get().?);
+    try testing.expectEqual(args[2], spec.erased_reuse_arg.get().?);
+    try testing.expect(spec.erased_call_args.get() != null);
+
+    // record = erased_capture_load(capture, reuse); y' = record.0;
+    // a = task_result_buffer(task); t' = ptr_load(a); v = C(y', t', task); ret v
+    const load = f.at(spec.body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.erased_capture_load, load.op);
+    const field = f.at(load.next).assign_ref;
+    const address = f.at(field.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_result_buffer, address.op);
+    const result = f.at(address.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.ptr_load, result.op);
+    const call = f.at(result.next).assign_call;
+    try testing.expectEqual(c, call.proc);
+    const call_args = try f.locals(call.args);
+    defer testing.allocator.free(call_args);
+    try testing.expectEqualSlices(LocalId, &.{ field.target, result.target, args[0] }, call_args);
+    try testing.expectEqual(call.target, f.at(call.next).ret.value);
+}
+
+test "a hosted site reads the slot's address, branches on the poll, and the hosted procedure takes the host's shape" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const hosted_arg = try f.local();
+    const hosted = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(99),
+        .args = try f.store.addLocalSpan(&.{hosted_arg}),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_suspending"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const x = try f.local();
+    const t = try f.local();
+    const s = try f.local();
+    // f(x) = t = hosted(x); s = {t, x}; ret s
+    const ret = try f.stmt(.{ .ret = .{ .value = s } });
+    const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, x }), .next = ret } });
+    const site = try f.stmt(.{ .assign_call = .{ .target = t, .proc = hosted, .args = try f.store.addLocalSpan(&.{x}), .next = build } });
+    const p = try f.addProc(&.{x}, &.{ x, t, s }, site);
+    const count = f.store.procSpecCount();
+
+    try run(testing.allocator, &f.store, &f.layouts);
+
+    const r: ProcId = @fromBackingInt(@intCast(count + 1));
+    const f_args = try f.locals(f.spec(p).args);
+    defer testing.allocator.free(f_args);
+    const task = f_args[1];
+
+    // The hosted procedure takes the task and a result pointer first and
+    // returns a U32 poll.
+    const hosted_args = try f.locals(f.spec(hosted).args);
+    defer testing.allocator.free(hosted_args);
+    try testing.expectEqual(@as(usize, 3), hosted_args.len);
+    try testing.expectEqual(@import("layout").Idx.opaque_ptr, f.store.getLocal(hosted_args[0]).layout_idx);
+    try testing.expectEqual(hosted_arg, hosted_args[2]);
+    try testing.expectEqual(@import("layout").Idx.u32, f.spec(hosted).ret_layout);
+
+    // slot = task_hosted_slot(task); poll = hosted(task, slot, x); switch poll
+    const slot = f.at(site).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_hosted_slot, slot.op);
+    const call = f.at(slot.next).assign_call;
+    try testing.expectEqual(hosted, call.proc);
+    const call_args = try f.locals(call.args);
+    defer testing.allocator.free(call_args);
+    try testing.expectEqualSlices(LocalId, &.{ task, slot.target, x }, call_args);
+    try testing.expectEqual(@import("layout").Idx.u32, f.store.getLocal(call.target).layout_idx);
+    const branch = f.at(call.next).switch_stmt;
+    try testing.expectEqual(call.target, branch.cond);
+    try testing.expect(branch.default_is_cold);
+    // Ready: t = ptr_load(slot), then the code after the call.
+    const ready = f.store.getCFSwitchBranches(branch.branches);
+    try testing.expectEqual(@as(usize, 1), GuardedList.borrowLen(ready));
+    const ready_branch = GuardedList.at(f.store.getCFSwitchBranches(branch.branches), 0);
+    try testing.expectEqual(@as(u64, 0), ready_branch.value);
+    const load = f.at(ready_branch.body).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.ptr_load, load.op);
+    try testing.expectEqual(t, load.target);
+    try testing.expectEqual(build, load.next);
+    // Pending: set the flag, save x, return.
+    const pending = f.at(branch.default_branch).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_set_pending, pending.op);
+    _ = try expectPendingEdge(&f, pending.next, task, r, &.{x});
+
+    // The resume entry reads the result from the hosted slot.
+    const entry = f.spec(r);
+    const capture_load = f.at(entry.body.get().?).assign_low_level;
+    const field = f.at(capture_load.next).assign_ref;
+    try testing.expectEqual(LIR.LowLevel.task_hosted_slot, f.at(field.next).assign_low_level.op);
 }

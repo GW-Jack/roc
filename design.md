@@ -33734,6 +33734,39 @@ a tail site's return of a value-less target is checked against that state.
 In a procedure that may suspend, ARC defers no erased call, so no such
 procedure uses a pending cell.
 
+**Building the edges.** The pass builds a site's pending edge wherever the
+site occurs: in `f`'s own body, rewriting the site in place, and in every
+copy that stops at it, so each copy saves the same `R(f, j)`. It copies
+before it rewrites `f`, so every copy starts from code without edges. The
+test after a procedure site reads `task_ready(task)` into a `Bool` just
+before the `switch_initialized_payload`, whose initialized side is the code
+after the call (in a copy, the tail call to `C(f, j)`).
+
+A record's capture layout is the struct of its saved values' layouts, in
+ascending local order. Its `on_drop` is the `host_drop` RC helper of that
+layout, and a hosted site's `slot_drop` is the `host_drop` helper of the
+hosted result's layout; each is `none` where the helper does nothing.
+
+The hosted rewrite changes each `suspending` hosted procedure's signature
+once, for all its callers. Its arguments become the task, a `Ptr` to its
+result layout, then its explicit arguments, and its result layout becomes
+`U32`, the width of the C `RocPoll` enum: `ROC_READY` is 0 and
+`ROC_PENDING` is 1. At a site, `p = task_hosted_slot(task)` comes first and
+the call's target becomes the poll. The ready branch, value 0, defines the
+original target with `ptr_load(p)`, so the values live across the site are
+the ones the pass computed. Every other value takes the cold pending edge,
+which begins with `task_set_pending(task)`. A `ptr_load` result is owned, so
+ARC releases a hosted result nothing reads as it releases any dead owned
+value.
+
+A resume entry's body loads its capture with `erased_capture_load` when it
+saves anything, and reads each saved value as a field. It reads the call's
+result with `ptr_load` from `task_result_buffer(task)` or
+`task_hosted_slot(task)`, and calls `C(f, k)` with the live values in
+ascending order (the result in its place among them), then the task. It
+reads the result whether or not the continuation takes it, so a result the
+code after the call never reads is released there.
+
 ### Records And The Task
 
 A record is an erased callable: `R(f, k)` with the saved values as its
