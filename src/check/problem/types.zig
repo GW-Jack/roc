@@ -174,6 +174,9 @@ pub const PlatformHostedSection = struct {
         reserved_symbol,
         /// The symbol starts with the internal roc__ namespace prefix
         reserved_prefix,
+        /// A `suspending` hosted function in a platform whose concurrency
+        /// mode is not `Tasks`
+        suspending_without_tasks,
     },
 };
 

@@ -4503,6 +4503,7 @@ fn canonicalizeAssociatedItems(
                                 if (name_ident.eql(decl_ident)) {
                                     // Skip the next statement since we're processing it now
                                     i = next_i;
+                                    try self.reportSuspendingWithDefinition(ta.is_suspending, self.parse_ir.tokenizedRegionToRegion(ta.region));
                                     const decl_region = self.parse_ir.tokenizedRegionToRegion(decl.region);
                                     if (try self.associatedValueWasRedeclared(associated_value_regions, decl_ident, decl_region)) {
                                         break :blk true;
@@ -4563,13 +4564,14 @@ fn canonicalizeAssociatedItems(
                     }
                     const parent_text = self.env.getIdent(parent_name);
                     const name_text = self.env.getIdent(name_ident);
+                    const suspending_kind = try self.annotationOnlyKind(ta.is_suspending, type_anno_idx, region);
                     const annotation_expr_kind: AnnotationExprKind = if (self.env.store.getTypeAnno(type_anno_idx) == .underscore)
                         if (self.derivedMethodKind(name_ident)) |kind|
                             .{ .derived = .{ .kind = kind, .owner = owner_stmt_idx } }
                         else
                             .unsupported_generated_method
                     else
-                        .ordinary;
+                        suspending_kind;
                     const qualified_idx = try self.insertQualifiedIdent(parent_text, name_text);
                     const assoc_key: ?AST.DeclIndex.AssocValue = if (owner_type_path) |owner|
                         .{ .owner = owner, .item = name_ident }
@@ -5128,6 +5130,7 @@ pub fn canonicalizeFile(
 
                             if (names_match) {
                                 i = next_i;
+                                try self.reportSuspendingWithDefinition(ta.is_suspending, region);
                                 // If we skipped malformed statements, the annotation had parse errors;
                                 // don't attach it (to avoid confusing type mismatch errors).
                                 _ = try self.canonicalizeStmtDecl(next_stmt_id, decl, if (skipped_malformed) null else TypeAnnoIdent{
@@ -5141,7 +5144,7 @@ pub fn canonicalizeFile(
                                 // Names don't match - create an anno-only def for this annotation
                                 // and let the next iteration handle the decl normally
                                 const parser_decl_idx = self.parse_ir.decl_index.declForStatement(@backingInt(stmt_id));
-                                const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, .ordinary, where_clauses, region, parser_decl_idx);
+                                const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, try self.annotationOnlyKind(ta.is_suspending, type_anno_idx, region), where_clauses, region, parser_decl_idx);
                                 try self.env.store.addScratchDef(def_idx);
                                 try self.recordGlobalValueDef(def_idx);
 
@@ -5157,7 +5160,7 @@ pub fn canonicalizeFile(
                             // If the next non-malformed stmt is not a decl,
                             // create a Def with an e_anno_only body
                             const parser_decl_idx = self.parse_ir.decl_index.declForStatement(@backingInt(stmt_id));
-                            const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, .ordinary, where_clauses, region, parser_decl_idx);
+                            const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, try self.annotationOnlyKind(ta.is_suspending, type_anno_idx, region), where_clauses, region, parser_decl_idx);
                             try self.env.store.addScratchDef(def_idx);
                             try self.recordGlobalValueDef(def_idx);
 
@@ -5177,7 +5180,7 @@ pub fn canonicalizeFile(
                 // (This handles the case where the type annotation is the last statement in the file)
                 if (next_i >= ast_stmt_idxs.len) {
                     const parser_decl_idx = self.parse_ir.decl_index.declForStatement(@backingInt(stmt_id));
-                    const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, .ordinary, where_clauses, region, parser_decl_idx);
+                    const def_idx = try self.createAnnotationDef(name_ident, name_ident, self.parse_ir.tokens.resolve(ta.name), type_anno_idx, try self.annotationOnlyKind(ta.is_suspending, type_anno_idx, region), where_clauses, region, parser_decl_idx);
                     try self.env.store.addScratchDef(def_idx);
                     try self.recordGlobalValueDef(def_idx);
 
@@ -5333,12 +5336,36 @@ fn derivedMethodKind(self: *const Self, ident: Ident.Idx) ?CIR.DerivedMethodKind
 
 const AnnotationExprKind = union(enum) {
     ordinary,
+    suspending,
     derived: struct {
         kind: CIR.DerivedMethodKind,
         owner: Statement.Idx,
     },
     unsupported_generated_method,
 };
+
+/// The kind of an annotation-only declaration written with or without
+/// `suspending`. The marker needs a `=>` function type written in the
+/// annotation itself; otherwise it is reported and the declaration is
+/// ordinary.
+fn annotationOnlyKind(
+    self: *Self,
+    is_suspending: bool,
+    type_anno_idx: CIR.TypeAnno.Idx,
+    region: Region,
+) std.mem.Allocator.Error!AnnotationExprKind {
+    if (!is_suspending) return .ordinary;
+    const type_anno = self.env.store.getTypeAnno(type_anno_idx);
+    if (type_anno == .@"fn" and type_anno.@"fn".effectful) return .suspending;
+    try self.env.pushDiagnostic(Diagnostic{ .suspending_not_effectful = .{ .region = region } });
+    return .ordinary;
+}
+
+/// Reports `suspending` on an annotation that has a definition.
+fn reportSuspendingWithDefinition(self: *Self, is_suspending: bool, region: Region) std.mem.Allocator.Error!void {
+    if (!is_suspending) return;
+    try self.env.pushDiagnostic(Diagnostic{ .suspending_not_hosted = .{ .region = region } });
+}
 
 fn addAnnotationExpr(
     self: *Self,
@@ -5348,6 +5375,7 @@ fn addAnnotationExpr(
 ) std.mem.Allocator.Error!Expr.Idx {
     const expr = switch (annotation_expr_kind) {
         .ordinary => Expr{ .e_anno_only = .{ .ident = ident } },
+        .suspending => Expr{ .e_anno_only = .{ .ident = ident, .kind = .suspending } },
         .derived => |derived| Expr{ .e_derived_method = .{
             .ident = ident,
             .kind = derived.kind,
@@ -12828,6 +12856,9 @@ fn runExprKernel(
                     }
                 },
                 .type_anno => |ta| type_anno_blk: {
+                    // The parser recognizes `suspending` only at the top level
+                    // and in associated blocks.
+                    std.debug.assert(!ta.is_suspending);
                     const region = self.parse_ir.tokenizedRegionToRegion(ta.region);
                     const name_ident = self.parse_ir.tokens.resolveIdentifier(ta.name) orelse {
                         const feature = try self.env.insertString("type annotation identifier resolution");

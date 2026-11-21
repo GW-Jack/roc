@@ -458,6 +458,8 @@ const copied_diagnostic_shapes = [_]DiagnosticShape{
     .{ .cir = "redundant_return", .tag = .diag_redundant_return, .payload = null, .names = &.{} },
     .{ .cir = "unreachable_code", .tag = .diag_unreachable_code, .payload = null, .names = &.{} },
     .{ .cir = "range_op_chained", .tag = .diag_range_op_chained, .payload = null, .names = &.{} },
+    .{ .cir = "suspending_not_hosted", .tag = .diag_suspending_not_hosted, .payload = null, .names = &.{} },
+    .{ .cir = "suspending_not_effectful", .tag = .diag_suspending_not_effectful, .payload = null, .names = &.{} },
     .{ .cir = "ident_already_in_scope", .tag = .diag_ident_already_in_scope, .payload = "diag_single_ident", .names = &.{"ident"} },
     .{ .cir = "provided_value_is_required", .tag = .diag_provided_value_is_required, .payload = "diag_single_ident", .names = &.{"ident"} },
     .{ .cir = "ident_not_in_scope", .tag = .diag_ident_not_in_scope, .payload = "diag_single_ident", .names = &.{"ident"} },
@@ -771,6 +773,8 @@ const DiagnosticNodeTag = enum {
     diag_mutually_recursive_type_aliases,
     diag_deprecated_number_suffix,
     diag_range_op_chained,
+    diag_suspending_not_hosted,
+    diag_suspending_not_effectful,
     diag_unnamed_field_cannot_have_default,
     diag_default_not_allowed_in_structural_record,
     diag_default_not_allowed_on_local_type_decl,
@@ -1253,7 +1257,7 @@ pub fn deinit(store: *NodeStore) void {
 /// when adding/removing variants from ModuleEnv unions. Update these when modifying the unions.
 ///
 /// Count of the diagnostic nodes in the ModuleEnv
-pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 98;
+pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 100;
 /// Count of the expression nodes in the ModuleEnv
 pub const MODULEENV_EXPR_NODE_COUNT = 59;
 /// Count of the statement nodes in the ModuleEnv
@@ -2023,6 +2027,7 @@ fn exprFromNode(store: *const NodeStore, node_idx: Node.Idx, node: Node) CIR.Exp
             return CIR.Expr{ .e_hosted_lambda = .{
                 .symbol_name = @bitCast(p.symbol_name),
                 .args = .{ .span = .{ .start = args_span.start, .len = args_span.len } },
+                .suspending = p.suspending != 0,
             } };
         },
         .expr_run_low_level => {
@@ -3659,6 +3664,7 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
             node.setPayload(.{ .expr_hosted_lambda = .{
                 .symbol_name = @bitCast(hosted.symbol_name),
                 .args_span2_idx = args_span2_idx,
+                .suspending = @intFromBool(hosted.suspending),
             } });
         },
         .e_run_low_level => |run_ll| {
@@ -5432,6 +5438,8 @@ pub fn addDiagnosticUnregistered(store: *NodeStore, reason: CIR.Diagnostic) Allo
         .invalid_associated_statement,
         .expr_not_canonicalized,
         .range_op_chained,
+        .suspending_not_hosted,
+        .suspending_not_effectful,
         .expr_syntax_error,
         .unreachable_string_pattern_capture,
         .pattern_arg_invalid,
@@ -5685,6 +5693,8 @@ pub fn getDiagnostic(store: *const NodeStore, diagnostic: CIR.Diagnostic.Idx) CI
         .diag_var_reassigned_in_expect,
         .diag_deprecated_number_suffix,
         .diag_range_op_chained,
+        .diag_suspending_not_hosted,
+        .diag_suspending_not_effectful,
         .diag_unnamed_field_cannot_have_default,
         .diag_default_not_allowed_in_structural_record,
         .diag_default_not_allowed_on_local_type_decl,

@@ -149,6 +149,15 @@ pub const Diagnostic = union(enum) {
     range_op_chained: struct {
         region: Region,
     },
+    /// `suspending` on an annotation that has a definition: only a hosted
+    /// function can pause its task.
+    suspending_not_hosted: struct {
+        region: Region,
+    },
+    /// `suspending` on an annotation not written as a `=>` function type.
+    suspending_not_effectful: struct {
+        region: Region,
+    },
     /// This expression was replaced by a runtime error because it did not
     /// parse; the parser reports the syntax error itself.
     expr_syntax_error: struct {
@@ -635,6 +644,8 @@ pub const Diagnostic = union(enum) {
             .mutually_recursive_type_aliases => |d| d.region,
             .deprecated_number_suffix => |d| d.region,
             .range_op_chained => |d| d.region,
+            .suspending_not_hosted => |d| d.region,
+            .suspending_not_effectful => |d| d.region,
             // A diagnostic about its file as a whole never stands in for a
             // malformed node, the only consumer of a diagnostic's region.
             .type_module_missing_matching_type, .default_app_missing_main, .module_name_reserved => base.invariant("file-level diagnostic {s} has no region", .{@tagName(self)}),

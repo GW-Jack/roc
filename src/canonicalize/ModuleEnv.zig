@@ -4034,6 +4034,37 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
 
             break :blk report;
         },
+        .suspending_not_hosted => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Suspending Needs A Hosted Function", "", .runtime_error);
+            try report.headline.addReflowingText("Only a hosted function can be ");
+            try report.headline.addInlineCode("suspending");
+            try report.headline.addReflowingText(". This declaration has a definition, so it runs Roc code and can't pause its task by itself.");
+
+            try self.addOwnedSourceRegionTo(&report, region_info, .error_highlight, filename);
+
+            try report.document.addLineBreak();
+            try report.document.addReflowingText("Remove ");
+            try report.document.addInlineCode("suspending");
+            try report.document.addReflowingText(". Code that calls a suspending hosted function can already pause.");
+
+            break :blk report;
+        },
+        .suspending_not_effectful => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Suspending Needs An Effectful Function", "", .runtime_error);
+            try report.headline.addReflowingText("A ");
+            try report.headline.addInlineCode("suspending");
+            try report.headline.addReflowingText(" declaration must be annotated as an effectful function, written with ");
+            try report.headline.addInlineCode("=>");
+            try report.headline.addReflowingText(".");
+
+            try self.addOwnedSourceRegionTo(&report, region_info, .error_highlight, filename);
+
+            break :blk report;
+        },
         .range_op_chained => |data| blk: {
             const region_info = self.calcRegionInfo(data.region);
 

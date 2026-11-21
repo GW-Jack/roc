@@ -592,6 +592,7 @@ test "NodeStore round trip - Expressions" {
         .e_hosted_lambda = .{
             .symbol_name = rand_ident_idx(),
             .args = CIR.Pattern.Span{ .span = rand_span() },
+            .suspending = true,
         },
     });
     try expressions.append(gpa, CIR.Expr{
@@ -1378,6 +1379,18 @@ test "NodeStore round trip - Diagnostics" {
 
     try diagnostics.append(gpa, CIR.Diagnostic{
         .range_op_chained = .{
+            .region = rand_region(),
+        },
+    });
+
+    try diagnostics.append(gpa, CIR.Diagnostic{
+        .suspending_not_hosted = .{
+            .region = rand_region(),
+        },
+    });
+
+    try diagnostics.append(gpa, CIR.Diagnostic{
+        .suspending_not_effectful = .{
             .region = rand_region(),
         },
     });

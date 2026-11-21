@@ -63,6 +63,9 @@ pub const TypeDispatchOwner = union(enum) {
 /// Why an annotation-only expression has no Roc implementation.
 pub const AnnotationOnlyKind = enum(u8) {
     ordinary,
+    /// A `suspending` declaration, which the hosted rewrite turns into a
+    /// suspending `e_hosted_lambda`.
+    suspending,
     unsupported_generated_method,
 };
 
@@ -676,6 +679,8 @@ pub const Expr = union(enum) {
     e_hosted_lambda: struct {
         symbol_name: base.Ident.Idx,
         args: CIR.Pattern.Span,
+        /// Declared `suspending`: the host may pause the calling task.
+        suspending: bool = false,
     },
 
     /// A low-level builtin operation.
@@ -1545,6 +1550,7 @@ pub const Expr = union(enum) {
                 const begin = try tree.beginNamedNode("e-hosted-lambda");
                 const symbol_name = ir.common.getIdent(hosted.symbol_name);
                 try tree.pushStringPair("symbol", symbol_name);
+                if (hosted.suspending) try tree.pushBoolPair("suspending", true);
                 try ir.appendRegionInfoToSExprTree(tree, expr_idx);
                 const attrs = tree.beginNode();
 

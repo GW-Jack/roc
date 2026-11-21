@@ -1775,6 +1775,8 @@ fn canDiagnosticIsError(diag: anytype) bool {
         .invalid_associated_statement,
         .expr_not_canonicalized,
         .range_op_chained,
+        .suspending_not_hosted,
+        .suspending_not_effectful,
         .expr_syntax_error,
         .unreachable_string_pattern_capture,
         .pattern_arg_invalid,

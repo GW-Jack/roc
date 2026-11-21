@@ -134,6 +134,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_10724_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10765_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10792_test.zig"));
+    std.testing.refAllDecls(@import("test/suspending_hosted_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11077_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11736_test.zig"));
     std.testing.refAllDecls(@import("test/issue_11863_test.zig"));

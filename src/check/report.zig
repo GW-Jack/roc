@@ -5539,6 +5539,19 @@ pub const ReportBuilder = struct {
                 D.bytes("roc__").withAnnotation(.inline_code),
                 D.bytes("prefix is reserved for symbols the Roc compiler generates internally. Pick a different symbol."),
             }, self, &report, &report.headline),
+            .suspending_without_tasks => try D.renderSliceInto(&.{
+                D.bytes("The hosted function"),
+                D.bytes(name).withAnnotation(.inline_code),
+                D.bytes("is"),
+                D.bytes("suspending").withAnnotation(.inline_code),
+                D.bytes(",").withNoPrecedingSpace(),
+                D.bytes("but this platform doesn't declare"),
+                D.bytes("concurrency: Tasks").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+                D.bytes("Without it, hosted calls always finish before they return, so nothing can pause. Add the field to the platform header, or remove"),
+                D.bytes("suspending").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report, &report.headline),
         }
 
         return report;

@@ -100,6 +100,7 @@ pub fn replaceAnnoOnlyWithHosted(env: *ModuleEnv) Allocator.Error!void {
                 .e_hosted_lambda = .{
                     .symbol_name = ident,
                     .args = args_span,
+                    .suspending = expr.e_anno_only.kind == .suspending,
                 },
             }, def_region);
 

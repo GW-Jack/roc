@@ -33530,16 +33530,21 @@ Checking makes both inputs exact before anything later reads them:
   as not yet implemented, until shared counts exist; neither error leaves
   a mode for later stages to guess at, and the platform's recorded mode is
   `None` after either.
-- Canonicalization keeps the marker on the annotation-only definition it
-  makes. The hosted transform copies it onto the hosted lambda, and the
-  checked hosted procedure table carries it, so the marker is never read
-  from syntax again.
-- The checker reports `suspending` on an annotation that does not become a
-  hosted procedure (a definition with a body, or one outside the platform
-  package), on a hosted procedure whose type is not `=>`, and on any hosted
-  procedure of a platform whose mode is not `Tasks`. The last check runs
-  with the platform root's hosted section check, after the platform's type
-  modules.
+- Canonicalization reports `suspending` on an annotation that has a
+  definition (`suspending_not_hosted`) and on one not written as a `=>`
+  function type (`suspending_not_effectful`). The second rule is about the
+  annotation as written, because the hosted transform already takes a hosted
+  function's arguments from it; an alias of an effectful function does not
+  qualify. Otherwise the annotation-only definition gets kind `suspending`.
+  One outside the platform package never becomes hosted and is reported as
+  any other declaration without a value.
+- The hosted transform copies the marker onto the hosted lambda
+  (`e_hosted_lambda.suspending`), and the checked hosted procedure table
+  carries it (`HostedProc.suspending`), so the marker is never read from
+  syntax again.
+- The checker reports a `suspending` hosted procedure of a platform whose
+  mode is not `Tasks`. This runs with the platform root's hosted section
+  check, after the platform's type modules.
 
 With `concurrency: None` every hosted call completes before it returns, no
 procedure may suspend, and none of the passes below changes anything.

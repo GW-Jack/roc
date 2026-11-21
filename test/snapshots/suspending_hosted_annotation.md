@@ -102,14 +102,14 @@ Http := [].{
 (can-ir
 	(d-let
 		(p-assign (ident "Http.get_utf8!"))
-		(e-anno-only)
+		(e-anno-only (kind "suspending"))
 		(annotation
 			(ty-fn (effectful true)
 				(ty-lookup (name "Str") (builtin))
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "Http.post!"))
-		(e-anno-only)
+		(e-anno-only (kind "suspending"))
 		(annotation
 			(ty-fn (effectful true)
 				(ty-lookup (name "Str") (builtin))

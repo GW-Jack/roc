@@ -21594,6 +21594,21 @@ fn checkPlatformHostedSection(self: *Self) std.mem.Allocator.Error!void {
         try self.checkHostSymbol(symbol_text, &symbols);
     }
 
+    // A suspending hosted function needs a platform that lets tasks pause.
+    if (self.cir.concurrency_mode != .tasks) {
+        var suspending_it = declared.iterator();
+        while (suspending_it.next()) |decl| {
+            const def = decl.key_ptr.module.store.getDef(decl.key_ptr.def);
+            const expr = decl.key_ptr.module.store.getExpr(def.expr);
+            if (expr != .e_hosted_lambda or !expr.e_hosted_lambda.suspending) continue;
+            const name_idx = try self.problems.putExtraString(decl.value_ptr.*);
+            _ = try self.problems.appendProblem(.{ .platform_hosted_section = .{
+                .name = name_idx,
+                .reason = .suspending_without_tasks,
+            } });
+        }
+    }
+
     // Every declared hosted function needs exactly one section entry.
     var declared_it = declared.iterator();
     while (declared_it.next()) |decl| {
@@ -33529,7 +33544,7 @@ fn checkLeafExpr(self: *Self, frame: *ExprCheckFrame, expected: Expected, env: *
                 else
                     expr_region;
                 switch (anno.kind) {
-                    .ordinary => _ = try self.problems.appendProblem(.{ .annotation_only_value = .{
+                    .ordinary, .suspending => _ = try self.problems.appendProblem(.{ .annotation_only_value = .{
                         .region = annotation_region,
                     } }),
                     .unsupported_generated_method => _ = try self.problems.appendProblem(.{ .unsupported_generated_method = .{

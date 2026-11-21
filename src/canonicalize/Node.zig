@@ -297,6 +297,8 @@ pub const Tag = enum {
     diag_mutually_recursive_type_aliases,
     diag_deprecated_number_suffix,
     diag_range_op_chained,
+    diag_suspending_not_hosted,
+    diag_suspending_not_effectful,
     diag_unnamed_field_cannot_have_default,
     diag_default_not_allowed_in_structural_record,
     diag_default_not_allowed_on_local_type_decl,
@@ -838,7 +840,9 @@ pub const Payload = extern union {
     pub const ExprHostedLambda = extern struct {
         symbol_name: u32,
         args_span2_idx: u32, // Index into span2_data: (args.start, args.len)
-        _reserved: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        /// 1 when the declaration is `suspending`, else 0.
+        suspending: u8,
+        _reserved: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const ExprRunLowLevel = extern struct {

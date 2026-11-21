@@ -442,7 +442,8 @@ pub const Constants = struct {
     /// 205: selected data hoists carry their callable-slot proof and validation
     /// candidates survive until request eligibility is known.
     /// 206: module environments record the platform's concurrency mode.
-    pub const CACHE_VERSION = 206;
+    /// 207: hosted lambdas and checked hosted procedures carry `suspending`.
+    pub const CACHE_VERSION = 207;
 };
 
 /// Configuration for the Roc cache system.
