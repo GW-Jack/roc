@@ -33642,8 +33642,10 @@ header. So for each site `k` of a procedure `f` that is not a tail site, the
 pass makes a *continuation procedure* `C(f, k)`. Its arguments are the
 values live after the call, the call's result when the code after the call
 reads it, and the task. A value is live when some path from the call reads
-it before writing it, and a join's `retained` locals count as read in its
-body. A hosted site's result is its `RocPoll`, which nothing reads after the
+it before writing it, and a join's `retained` locals count as read at the
+start of its body. The pass computes
+each site's live values and whether it is a tail site once, from the LIR it
+is given, with the shared read and definition inventories. A hosted site's result is its `RocPoll`, which nothing reads after the
 test; its continuation begins with the read from the slot.
 
 The body of `C(f, k)` is a copy of the code that runs after the call: the

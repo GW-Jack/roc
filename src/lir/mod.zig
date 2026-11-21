@@ -81,6 +81,7 @@ pub const ImmortalLocals = @import("immortal_locals.zig");
 /// Decides where erased calls left pending by a tail call are run.
 pub const TailDrive = @import("tail_drive.zig");
 pub const SuspensionMarks = @import("suspension_marks.zig");
+pub const ContinuationSites = @import("continuation_sites.zig");
 /// Function values built in their caller's frame.
 pub const FrameCallables = @import("frame_callables.zig");
 /// Final immutable failure-image guards and explicit completion.
@@ -174,6 +175,7 @@ test "lir tests" {
     std.testing.refAllDecls(ReachableProcs);
     std.testing.refAllDecls(CheckedPipeline);
     std.testing.refAllDecls(SuspensionMarks);
+    std.testing.refAllDecls(ContinuationSites);
     std.testing.refAllDecls(BoxReuse);
     std.testing.refAllDecls(ReturnSlot);
     std.testing.refAllDecls(StrAppend);
