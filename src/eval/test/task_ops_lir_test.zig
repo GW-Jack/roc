@@ -167,3 +167,225 @@ test "task_hosted_slot and task_result_buffer address the task's buffers" {
     try std.testing.expectEqual(@as(u64, 78), buffer);
     try f.runtime_env.checkForLeaks();
 }
+
+/// What the test host saw at its one suspending hosted call.
+const PausingHost = struct {
+    calls: u32 = 0,
+    task: ?*RocTask = null,
+    slot: ?[*]u8 = null,
+    x: u64 = 0,
+
+    fn dispatch(context: *anyopaque, call: eval.Interpreter.HostedCall) eval.Interpreter.Error!void {
+        const self: *PausingHost = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.task = @ptrFromInt(std.mem.readInt(usize, call.args[call.arg_offsets[0]..][0..@sizeOf(usize)], .little));
+        self.slot = @ptrFromInt(std.mem.readInt(usize, call.args[call.arg_offsets[1]..][0..@sizeOf(usize)], .little));
+        self.x = std.mem.readInt(u64, call.args[call.arg_offsets[2]..][0..8], .little);
+        // Pending: the host writes the slot and wakes the task later.
+        std.mem.writeInt(u32, call.ret[0..4], 1, .little);
+    }
+};
+
+/// A program whose task pauses at a suspending hosted call `h(x)` with a
+/// result of `hosted_ret`, after the continuation pass:
+/// `g(x) = t = h(x); ret (if add then t + x else x)`, a start procedure
+/// `s(task) = ret g(20, task)`, and `pack() = ret <s>`. Returns `pack`.
+fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTestError!LIR.LirProcSpecId {
+    const allocator = f.allocator;
+    const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const h = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{h_arg}),
+        .ret_layout = hosted_ret,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_pause"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const x = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const t = try f.store.addLocal(.{ .layout_idx = hosted_ret });
+    const r = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const after = if (add) try f.op(r, .num_int_add_wrap, &.{ t, x }, try f.ret(r)) else try f.ret(x);
+    const site = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = t,
+        .proc = h,
+        .args = try f.store.addLocalSpan(&.{x}),
+        .next = after,
+    } }, .test_fixture);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{x}),
+        .frame_locals = try f.store.addLocalSpan(&.{ x, t, r }),
+        .body = .some(site),
+        .ret_layout = .u64,
+    }, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store);
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts);
+
+    // The start record's procedure, built after the pass: the pass does not
+    // yet give an erased callable a task (design.md "What Implements It
+    // First"), so this one takes it as its explicit argument.
+    const s_task = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const s_capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const s_reuse = try f.store.addLocal(.{ .layout_idx = try f.layouts.insertErasedCallable() });
+    const s_x = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const s_r = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const s_call = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = s_r,
+        .proc = g,
+        .args = try f.store.addLocalSpan(&.{ s_x, s_task }),
+        .next = try f.ret(s_r),
+    } }, .test_fixture);
+    const s_lit = try f.store.addCFStmt(.{ .assign_literal = .{
+        .target = s_x,
+        .value = .{ .i64_literal = .{ .value = 20, .layout_idx = .u64 } },
+        .next = s_call,
+    } }, .test_fixture);
+    const s = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{ s_task, s_capture, s_reuse }),
+        .frame_locals = try f.store.addLocalSpan(&.{ s_task, s_capture, s_reuse, s_x, s_r }),
+        .body = .some(s_lit),
+        .ret_layout = .u64,
+        .abi = .erased_callable,
+        .erased_capture_arg = .some(s_capture),
+        .erased_reuse_arg = .some(s_reuse),
+        .erased_call_args = .some(try f.store.internErasedCallArgsPlan(&f.layouts, &.{.opaque_ptr})),
+    }, .none);
+
+    const start = try f.store.addLocal(.{ .layout_idx = try f.layouts.insertErasedCallable() });
+    const pack_body = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+        .target = start,
+        .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+            .proc = s,
+            .capture = null,
+            .capture_layout = null,
+            .on_drop = .none,
+        }),
+        .next = try f.ret(start),
+    } }, .test_fixture);
+    return try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .frame_locals = try f.store.addLocalSpan(&.{start}),
+        .body = .some(pack_body),
+        .ret_layout = try f.layouts.insertErasedCallable(),
+    }, .none);
+}
+
+/// An interpreter for `f`'s program whose hosted calls go to `host`, kept
+/// alive while its records are.
+const PausingRun = struct {
+    static_strings: eval.Interpreter.StaticStrings.Table,
+    interp: eval.Interpreter,
+
+    fn init(self: *PausingRun, f: *Fixture, host: *PausingHost) TaskOpsTestError!void {
+        self.static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+        errdefer self.static_strings.deinit();
+        self.interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, self.static_strings.view(), f.runtime_env.get_ops());
+        self.interp.hosted_call_handler = .{ .context = host, .dispatch = PausingHost.dispatch };
+    }
+
+    fn deinit(self: *PausingRun) void {
+        self.interp.deinit();
+        self.static_strings.deinit();
+    }
+
+    /// Pack the start record and make the task, whose root result is `root`.
+    fn start(self: *PausingRun, f: *Fixture, pack: LIR.LirProcSpecId, root: [*]u8, hosted_ret: layout.Idx) TaskOpsTestError!*RocTask {
+        const packed_start = try self.interp.eval(.{ .proc_id = pack });
+        const slot = f.layouts.layoutSizeAlign(f.layouts.getLayout(hosted_ret));
+        return RocTask.create(f.runtime_env.get_ops(), @ptrFromInt(packed_start.value.read(usize)), root, .{
+            .hosted_slot_size = slot.size,
+            .hosted_slot_alignment = slot.alignment.toByteUnits(),
+            .result_buffer_size = 0,
+            .result_buffer_alignment = 1,
+        });
+    }
+};
+
+test "a task paused at a hosted call resumes from its record and returns the root result" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const pack = try pausingProgram(&f, .u64, true);
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(&f, pack, @ptrCast(&root), .u64);
+
+    // The first run reaches the hosted call, which is pending: the task
+    // parks with g's record saved.
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    try std.testing.expectEqual(task, host.task.?);
+    try std.testing.expectEqual(@as(u64, 20), host.x);
+    try std.testing.expectEqual(@as(usize, 1), task.len);
+
+    // The host finishes: it writes the result and wakes the task, which
+    // resumes in g's continuation with x restored from the record.
+    @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
+    task.wake();
+    try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 42), root);
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "cancelling a woken task releases the hosted result in its slot and its records" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const pack = try pausingProgram(&f, .str, false);
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(&f, pack, @ptrCast(&root), .str);
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+
+    // The host writes a heap string and wakes the task, which is then
+    // cancelled instead of resumed: the record's slot release frees the
+    // string, and no abort runs.
+    const text = builtins.str.RocStr.fromSlice("a string too long to be small", f.runtime_env.get_ops());
+    try std.testing.expect(!text.isSmallStr());
+    @as(*align(1) builtins.str.RocStr, @ptrCast(host.slot.?)).* = text;
+    task.wake();
+    task.cancel(&abortUnexpected);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.status);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "cancelling a task the host has not finished aborts the host call and releases its records" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const pack = try pausingProgram(&f, .str, false);
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(&f, pack, @ptrCast(&root), .str);
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+
+    aborted = null;
+    task.cancel(&abortRecord);
+    try std.testing.expectEqual(task, aborted.?);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+var aborted: ?*RocTask = null;
+
+fn abortRecord(task: *RocTask) callconv(.c) void {
+    aborted = task;
+}
+
+fn abortUnexpected(_: *RocTask) callconv(.c) void {
+    std.debug.panic("a woken task's cancel aborted the host call", .{});
+}

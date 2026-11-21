@@ -408,6 +408,11 @@ pub const Interpreter = struct {
     /// native runtime records one: its closure, one reference to which it
     /// owns, and a copy of its argument record in `pending_storage`.
     pending_dyn: ?PendingDynCall = null,
+    /// Set by `suspend_return` while the activations above it unwind a
+    /// pause: each returns no value, as one that left a call pending does
+    /// (design.md "Pending edges"). The erased-call entry the task runtime
+    /// calls a record through clears it again.
+    unwinding_pause: bool = false,
     /// Set while an erased call is entering its callee, so that callee can
     /// tell this caller, which makes pending calls, from any other.
     erased_caller_drives: bool = false,
@@ -700,6 +705,8 @@ pub const Interpreter = struct {
 
     const ExecOutcome = union(enum) {
         returned: LocalId,
+        /// `suspend_return`: the procedure paused and returns no value.
+        suspended,
         /// A frame-replacing call: the procedure's result is whatever this
         /// call returns, so its own frame ends before the callee's begins.
         tail_call: TailCall,
@@ -2212,6 +2219,10 @@ pub const Interpreter = struct {
         const outcome = try self.execStmtChain(&frame, body);
         return switch (outcome) {
             .tail_call => |call| .{ .tail_call = try self.saveTailCall(call) },
+            .suspended => .{ .result = .{
+                .value = if (frame.dyn_result != null) Value.zst else try self.poisonUninitializedValue(proc_spec.ret_layout),
+                .layout = proc_spec.ret_layout,
+            } },
             .returned => |ret_local| blk: {
                 trace.log(
                     "return proc={d} name={d} depth={d}",
@@ -2222,7 +2233,7 @@ pub const Interpreter = struct {
                     // returned bytes unless the procedure built them there.
                     // A procedure that left a call pending returns no value.
                     const returned = try self.localBytes(&frame, ret_local);
-                    if (returned != result_storage and !self.hasPendingCall()) {
+                    if (returned != result_storage and !self.hasPendingCall() and !self.unwinding_pause) {
                         boxy.walk.copy(try self.localDesc(&frame, proc_spec.dyn_result.get().?), result_storage, returned);
                     }
                     break :blk .{ .result = .{ .value = Value.zst, .layout = proc_spec.ret_layout } };
@@ -2230,8 +2241,9 @@ pub const Interpreter = struct {
                 const raw_result = try self.getLocalChecked(&frame, ret_local);
                 const raw_layout = self.store.getLocal(ret_local).layout_idx;
                 // A procedure that left a call pending returns no value; the
-                // pending call produces the result.
-                if (self.hasPendingCall()) break :blk .{ .result = .{
+                // pending call produces the result. So does one unwinding a
+                // pause, whose returned local is a paused call's target.
+                if (self.hasPendingCall() or self.unwinding_pause) break :blk .{ .result = .{
                     .value = try self.poisonUninitializedValue(raw_layout),
                     .layout = raw_layout,
                 } };
@@ -2781,9 +2793,20 @@ pub const Interpreter = struct {
                     }
                     current = expect_stmt.next;
                 },
-                // Suspension needs the task runtime, which the interpreter gains with
-                // its test host (design.md "What Implements It First").
-                .suspend_save, .suspend_return => return self.triggerCrash("the interpreter does not implement suspension yet"),
+                .suspend_save => |save| {
+                    const data = self.store.stmtRow(save.data);
+                    const record = try self.packRecord(frame, current, data);
+                    const slot_drop: ?builtins.task.SlotDropFn = switch (data.slot_drop) {
+                        .none => null,
+                        .rc_helper => &interpreterSlotDrop,
+                    };
+                    taskOf(self.readPointerInt(try self.getLocalChecked(frame, save.task))).pushRecord(record, slot_drop);
+                    current = save.next;
+                },
+                .suspend_return => {
+                    self.unwinding_pause = true;
+                    return .suspended;
+                },
                 .runtime_error => {
                     if (builtin.mode == .debug) {
                         debugPrint(
@@ -3654,6 +3677,11 @@ pub const Interpreter = struct {
         out_desc: *?*const anyopaque,
     ) Error!void {
         self.bindCallerRocOps(ops);
+        // A pause inside the call reaches its caller through the task's
+        // pending flag, not through this activation's return.
+        const outer_unwinding = self.unwinding_pause;
+        self.unwinding_pause = false;
+        defer self.unwinding_pause = outer_unwinding;
         // The result is copied to `ret`, so nothing the call leaves in the
         // interpreter's stacks outlives it, including after a crash unwinds
         // past the frames that would release their own storage.
@@ -3919,6 +3947,82 @@ pub const Interpreter = struct {
         assign: anytype,
         target_layout: layout_mod.Idx,
     ) Error!Value {
+        const capture_value = if (assign.capture) |capture_local|
+            try self.getLocalChecked(frame, capture_local)
+        else
+            null;
+        const data_ptr = try self.packErasedCallable(frame, stmt_id, assign, capture_value, 0);
+        const result = try self.alloc(target_layout);
+        self.writeBoxedDataPointer(result, data_ptr);
+        return result;
+    }
+
+    /// Bytes between a hosted site's record context and its capture value,
+    /// holding the hosted result's layout for the slot's release.
+    const record_slot_prefix: usize = builtins.erased_callable.capture_alignment;
+
+    comptime {
+        std.debug.assert(record_slot_prefix >= @sizeOf(u32));
+    }
+
+    /// The record `suspend_save` packs: an erased callable of the resume
+    /// entry whose capture is the saved values at the capture layout. A
+    /// hosted site's record also holds the hosted result's layout, for the
+    /// release a cancelled task gives the slot.
+    fn packRecord(self: *LirInterpreter, frame: *Frame, stmt_id: CFStmtId, data: LIR.SuspendSaveData) Error![*]u8 {
+        const capture_value: ?Value = if (self.helper.sizeOf(data.capture_layout) > 0)
+            try self.evalStructLiteral(frame, data.saved, data.capture_layout)
+        else
+            null;
+        const prefix: usize = switch (data.slot_drop) {
+            .none => 0,
+            .rc_helper => record_slot_prefix,
+        };
+        const record = try self.packErasedCallable(frame, stmt_id, .{
+            .proc = data.proc,
+            .capture = @as(?bool, if (capture_value != null) true else null),
+            .capture_layout = @as(?layout_mod.Idx, if (capture_value != null) data.capture_layout else null),
+            .on_drop = data.on_drop,
+            .frame = false,
+            .reuse = @as(?LocalId, null),
+            .reuse_unique = false,
+        }, capture_value, prefix);
+        switch (data.slot_drop) {
+            .none => {},
+            .rc_helper => |helper| @as(*align(1) u32, @ptrCast(builtins.erased_callable.capturePtr(record) + erased_callable_context_capture_offset)).* = @backingInt(helper.layout_idx),
+        }
+        return record;
+    }
+
+    /// The release `RocTask.cancel` gives a hosted result the host wrote
+    /// before the task was cancelled: the RC helper of the layout the
+    /// hosted site's record holds.
+    fn interpreterSlotDrop(slot: [*]u8, record: [*]u8, ops: *RocOps) callconv(.c) void {
+        const context = erasedCallableInterpreterContextFromPayload(record);
+        const owner = context.owner;
+        if (owner) |retained| retained.enter();
+        defer if (owner) |retained| retained.leave();
+        context.interpreter.bindCallerRocOps(ops);
+        const layout_idx: layout_mod.Idx = @fromBackingInt(@intCast(@as(*align(1) const u32, @ptrCast(builtins.erased_callable.capturePtr(record) + erased_callable_context_capture_offset)).*));
+        context.interpreter.performRcHelperRequired(
+            .{ .op = .decref, .layout_idx = layout_idx },
+            .{ .ptr = slot },
+            1,
+            .atomic,
+        );
+    }
+
+    /// Build the erased callable `assign` describes over `capture_value`,
+    /// with `prefix` interpreter-private bytes between its context and its
+    /// capture value, and return its data pointer.
+    fn packErasedCallable(
+        self: *LirInterpreter,
+        frame: *Frame,
+        stmt_id: CFStmtId,
+        assign: anytype,
+        capture_value: ?Value,
+        prefix: usize,
+    ) Error![*]u8 {
         const has_capture = assign.capture != null;
         if (has_capture != (assign.capture_layout != null)) {
             return self.invariantFailedError(
@@ -3940,8 +4044,7 @@ pub const Interpreter = struct {
                 );
             }
         }
-        const result = try self.alloc(target_layout);
-        const capture_size = erased_callable_context_capture_offset + capture_value_size;
+        const capture_size = erased_callable_context_capture_offset + prefix + capture_value_size;
         const data_ptr = if (assign.frame) blk: {
             // The callable lives in this frame; its refcount word is the
             // frame marker, so retains and releases of it do nothing.
@@ -4002,17 +4105,13 @@ pub const Interpreter = struct {
         };
 
         const context = erasedCallableInterpreterContextFromPayload(data_ptr);
-        const capture_value = if (assign.capture) |capture_local|
-            try self.getLocalChecked(frame, capture_local)
-        else
-            null;
         if (owner) |retained| retained.retain();
         context.* = .{
             .owner = owner,
             .interpreter = self,
             .proc_id = @backingInt(assign.proc),
             .drop_layout_plus_one = if (drop_layout) |layout_idx| @backingInt(layout_idx) + 1 else 0,
-            .capture_value_offset = @intCast(erased_callable_context_capture_offset),
+            .capture_value_offset = @intCast(erased_callable_context_capture_offset + prefix),
             .drop_kind = @backingInt(capture_drop_kind),
             .padding = .{ 0, 0, 0 },
         };
@@ -4029,8 +4128,7 @@ pub const Interpreter = struct {
             }
         }
 
-        self.writeBoxedDataPointer(result, data_ptr);
-        return result;
+        return data_ptr;
     }
 
     const AllocatedStruct = struct {
