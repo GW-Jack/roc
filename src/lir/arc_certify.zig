@@ -1092,6 +1092,11 @@ const ValueInfo = struct {
     /// its arguments once, and a later switch on the same result decides
     /// nothing about them.
     call_refinement: ?LIR.CFStmtId = null,
+    /// The result of a call at a suspension site. When the callee paused,
+    /// it wrote no result, and the pending test after the call takes its
+    /// uninitialized side, where ARC releases nothing for the result
+    /// (design.md "The Continuation Pass").
+    suspension_result: bool = false,
 };
 
 /// One exact ownership state along a control-flow path. Forks share all
@@ -4151,7 +4156,11 @@ const Certifier = struct {
             const current_stmt = self.store.getCFStmtImmediate(current);
             if (first_visit) try self.erased_owners.noteStmt(self.store, self.layouts, current_stmt.*);
             switch (current_stmt.*) {
-                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
+                .suspend_save => |save_stmt| {
+                    try self.noteProcLocal(save_stmt.task);
+                    try self.noteProcLocalSpan(self.store.stmtRow(save_stmt.data).saved);
+                },
+                .suspend_return => {},
                 .assign_ref => |assign| {
                     try self.noteProcLocal(assign.target);
                     try self.noteProcLocal(body_clone.refOpSource(assign.op));
@@ -4559,7 +4568,6 @@ const Certifier = struct {
             }
             if (body_clone.definedTarget(current.*)) |target| self.setReadBeforeRebindDef(&graph, node_index, target);
             switch (current.*) {
-                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
                 .join => |join| {
                     try ensureReadBeforeRebindNode(&graph, &work, join.body);
                     try cache_roots.append(graph_allocator, join.body);
@@ -4586,6 +4594,8 @@ const Certifier = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -5800,7 +5810,18 @@ const Certifier = struct {
                 }
             }
             switch (stmt.*) {
-                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
+                // The task record takes one unit of each refcounted saved value,
+                // as an aggregate takes its fields.
+                .suspend_save => |save_stmt| {
+                    try self.applyAggregateStore(&state, save_stmt.task, self.store.getLocalSpan(self.store.stmtRow(save_stmt.data).saved));
+                    cursor = save_stmt.next;
+                },
+                // A paused procedure leaves owning nothing, as before any return.
+                .suspend_return => {
+                    try self.checkLeaks(&state);
+                    if (segment.walk != 0) try self.propagateTerminal(segment.walk);
+                    return;
+                },
                 .assign_ref => |assign| {
                     try self.validateResidualShellFields(&state, assign);
                     switch (assign.op.kind) {
@@ -5870,6 +5891,12 @@ const Certifier = struct {
                 },
                 .assign_call => |assign| {
                     try self.applyCall(&state, assign.target, self.sigs.get(assign.proc), assign.args, assign.next);
+                    // Only a refcounted result has a unit for the pending test to
+                    // settle; a hosted site's result is its poll status.
+                    if (self.store.stmtRowOrDefault(assign.extra).suspension_site and self.isRc(assign.target)) {
+                        const target_value = state.valueOf(assign.target);
+                        if (target_value != no_value) self.values.items[target_value].suspension_result = true;
+                    }
                     cursor = assign.next;
                 },
                 .assign_call_erased => |assign_stmt| {
@@ -6127,6 +6154,24 @@ const Certifier = struct {
                                 try uninitialized_state.bindValue(switch_stmt.payload, no_value);
                                 if (payload_dense != no_dense) try uninitialized_state.setMaybeUninitializedUnresolved(payload_dense, false);
                                 try work.append(self.allocator, .{ .segment = .{ .cursor = switch_stmt.uninitialized_branch, .state = uninitialized_state, .origin_join = segment.origin_join, .walk = segment.walk } });
+                                return;
+                            }
+                            // A suspension site's result is written only when the
+                            // callee returned: the pending test splits both ways,
+                            // and on the paused side the result holds no unit.
+                            if (self.values.items[payload_value].suspension_result) {
+                                var initialized_state = try state.clone();
+                                errdefer initialized_state.deinit();
+                                if (payload_dense != no_dense) try initialized_state.setMaybeUninitializedUnresolved(payload_dense, false);
+                                try work.append(self.allocator, .{ .segment = .{ .cursor = switch_stmt.initialized_branch, .state = initialized_state, .origin_join = segment.origin_join, .walk = segment.walk } });
+
+                                var paused_state = try state.clone();
+                                errdefer paused_state.deinit();
+                                const units = paused_state.balanceOf(payload_value);
+                                if (units > 0) try paused_state.addBalance(payload_value, -units);
+                                try paused_state.bindValue(switch_stmt.payload, no_value);
+                                if (payload_dense != no_dense) try paused_state.setMaybeUninitializedUnresolved(payload_dense, false);
+                                try work.append(self.allocator, .{ .segment = .{ .cursor = switch_stmt.uninitialized_branch, .state = paused_state, .origin_join = segment.origin_join, .walk = segment.walk } });
                                 return;
                             }
                         }
@@ -8263,6 +8308,74 @@ test "certify follows uninitialized payload switch branch when rc payload is unb
     // the certifier follows the uninitialized branch selected by ownership
     // state.
     try f.certify();
+}
+
+test "certify accepts a suspension site whose result is not refcounted" {
+    // A hosted site's result is its poll status: a scalar with no unit for
+    // a pending test to settle.
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const status_in_callee = try f.local(.i64);
+    const callee = try f.addProc(&.{}, try f.assignI64(status_in_callee, try f.ret(status_in_callee)), .i64);
+    const task = try f.local(.opaque_ptr);
+    const status = try f.local(.i64);
+    const call = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = status,
+        .proc = callee,
+        .args = LIR.LocalSpan.empty(),
+        .extra = try f.store.addOptionalStmtRow(LIR.CallExtra, .{ .suspension_site = true }),
+        .next = try f.ret(status),
+    } }, .test_fixture);
+    const caller = try f.addProc(&.{task}, call, .i64);
+    f.store.getProcSpecPtr(caller).suspends = .may;
+
+    try f.certify();
+}
+
+test "certify walks the paused side of a suspension site's pending test with no result unit" {
+    // After a call at a suspension site the pending test reads the call's
+    // result: on its uninitialized side the callee paused and wrote no
+    // result, so the frame releases nothing for it before pausing.
+    for ([_]bool{ false, true }) |release_on_paused_side| {
+        var f = try CertifyTest.init(testing.allocator);
+        defer f.deinit();
+        const produced = try f.local(.str);
+        const callee = try f.addProc(&.{}, try f.assignStr(produced, try f.ret(produced)), .str);
+
+        const task = try f.local(.opaque_ptr);
+        const payload = try f.local(.str);
+        const cond = try f.local(.i64);
+        const result = try f.local(.i64);
+        const ret = try f.ret(result);
+        const initialized_branch = try f.decrefStmt(payload, .str, try f.assignI64(result, ret));
+        const paused = try f.store.addCFStmt(.suspend_return, .test_fixture);
+        const uninitialized_branch = if (release_on_paused_side)
+            try f.decrefStmt(payload, .str, paused)
+        else
+            paused;
+        const pending_test = try f.store.addCFStmt(.{ .switch_initialized_payload = .{
+            .cond = cond,
+            .cond_mask = 1,
+            .payload = payload,
+            .initialized_branch = initialized_branch,
+            .uninitialized_branch = uninitialized_branch,
+        } }, .test_fixture);
+        const call = try f.store.addCFStmt(.{ .assign_call = .{
+            .target = payload,
+            .proc = callee,
+            .args = LIR.LocalSpan.empty(),
+            .extra = try f.store.addOptionalStmtRow(LIR.CallExtra, .{ .suspension_site = true }),
+            .next = try f.assignI64(cond, pending_test),
+        } }, .test_fixture);
+        const caller = try f.addProc(&.{task}, call, .i64);
+        f.store.getProcSpecPtr(caller).suspends = .may;
+
+        if (release_on_paused_side) {
+            try testing.expectError(error.Certification, f.certify());
+        } else {
+            try f.certify();
+        }
+    }
 }
 
 test "decref_if_initialized tracks a guarded cell release across aliases" {

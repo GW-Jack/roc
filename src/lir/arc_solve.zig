@@ -1499,7 +1499,6 @@ pub fn findOutcomeRefinement(
     var cursor = next;
     while (true) {
         switch (store.getCFStmt(cursor)) {
-            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| switch (assign.op.kind) {
                 .local => {
                     if (discriminant != null) return null;
@@ -1547,6 +1546,8 @@ pub fn findOutcomeRefinement(
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .switch_initialized_payload,
@@ -1774,7 +1775,7 @@ fn computeOutcomeRestitution(
                 }.go;
 
                 switch (stmt.*) {
-                    .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+                    .suspend_save, .suspend_return => solveInvariant("ARC outcome restitution walks no procedure that may suspend"),
                     inline .assign_ref, .init_uninitialized => |assign| {
                         if (assign.target == active_param) {
                             valid = false;
@@ -3141,7 +3142,22 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
     const store = solver.store;
     const allocator = solver.allocator;
     switch (store.getCFStmtImmediate(current).*) {
-        .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+        // The saved values move into the task record, which outlives this
+        // frame and runs the continuation procedure later. A saved operand is
+        // a borrowed occurrence: it demands nothing of its binding, since the
+        // record takes a retain of any unit the frame keeps (design.md "The
+        // Continuation Pass").
+        .suspend_save => |save_stmt| {
+            const save = store.stmtRow(save_stmt.data);
+            solver.address_taken.set(@backingInt(save.proc));
+            const saved = store.getLocalSpan(save.saved);
+            for (0..GuardedList.borrowLen(saved)) |index| {
+                const value = GuardedList.at(saved, index);
+                try liftVisibilitySeed(solver, value);
+                try solver.unique_facts.append(allocator, .{ .destroy = value });
+            }
+        },
+        .suspend_return => {},
         .assign_ref => |assign| {
             switch (assign.op.kind) {
                 .local => {
@@ -3893,7 +3909,14 @@ fn computeVisibilityFromLift(
         if (!reachable.isSet(stmt_index)) continue;
         const stmt = store.getCFStmtImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(stmt_index)))));
         switch (stmt.*) {
-            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+            // A saved value reaches the host through the task record.
+            .suspend_save => |save_stmt| {
+                const saved = store.getLocalSpan(store.stmtRow(save_stmt.data).saved);
+                for (0..GuardedList.borrowLen(saved)) |index| {
+                    seedLocal(&visible, rc_local, @backingInt(GuardedList.at(saved, index)));
+                }
+            },
+            .suspend_return => {},
             .assign_ref => |assign| {
                 const target = @backingInt(assign.target);
                 switch (assign.op.kind) {
@@ -6130,7 +6153,15 @@ fn computeUniquenessDetailed(
         } else reachable_iter.next() orelse break;
         const stmt = store.getCFStmt(@fromBackingInt(@intCast(@as(u32, @intCast(stmt_index)))));
         switch (stmt) {
-            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+            // The record shares each saved value with whatever later runs the
+            // continuation, so none stays unique.
+            .suspend_save => |save_stmt| {
+                const saved = store.getLocalSpan(store.stmtRow(save_stmt.data).saved);
+                for (0..GuardedList.borrowLen(saved)) |index| {
+                    marks.destroy(&destroyed, GuardedList.at(saved, index));
+                }
+            },
+            .suspend_return => {},
             .assign_ref => |assign| {
                 marks.trackDef(&has_def, &multi_def, assign.target);
                 const alias_of: ?LIR.LocalId = switch (assign.op.kind) {

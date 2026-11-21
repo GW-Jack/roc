@@ -2795,7 +2795,14 @@ const Inserter = struct {
         }
 
         var cloned: LIR.CFStmtId = switch (stmt) {
-            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+            .suspend_save => |save_stmt| blk: {
+                // The save takes one unit of every saved value: a retain
+                // before it pays for each value the frame keeps, and the
+                // solve moved in the rest.
+                const save = self.store.stmtRow(save_stmt.data);
+                const placed = try self.addWithNext(stmt, next, origin);
+                break :blk try self.retainSpanExceptPositions(save.saved, step.transfer_positions.of(u32, &self.arc_plans.positions), .{ .stmt = at, .reason = .stored_in_aggregate }, placed);
+            },
             .assign_ref => |assign| blk: {
                 if (step.retain_assign_ref_target) next = try self.retainLocalIfRc(assign.target, .{ .stmt = at, .reason = .alias_bind }, next);
                 break :blk try self.store.addCFStmt(.{ .assign_ref = .{
@@ -3029,6 +3036,7 @@ const Inserter = struct {
                 } }, origin);
             },
             .expect_err,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -3174,7 +3182,24 @@ const Inserter = struct {
 
             const stmt = self.store.getCFStmt(segment.cursor);
             switch (stmt) {
-                .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+                .suspend_save => |save_stmt| {
+                    // Saved operands are borrowed occurrences (design.md "The
+                    // Continuation Pass"): the record takes a unit the frame owns
+                    // that dies here, and a retain of anything else.
+                    const save = self.store.stmtRow(save_stmt.data);
+                    const step = try self.nextArcPlanStep(segment.plan_index, segment.cursor);
+                    self.transfer_position_scratch.clearRetainingCapacity();
+                    try self.savedTransferPositions(save.saved, save_stmt.next, &segment.owned, self.transfer_position_scratch);
+                    try step.transfer_positions.append(u32, self.solve_allocator, &self.arc_plans.positions, self.transfer_position_scratch.items);
+                    const singles = [_]LIR.LocalId{save_stmt.task};
+                    try self.finishArcPlanStepDeaths(step, &segment.owned, &singles, save.saved, save_stmt.next);
+                },
+                // A paused procedure returns no value; the frame releases what it
+                // owns, as before any return.
+                .suspend_return => {
+                    try self.setArcPlanTerminal(segment.plan_index, segment.cursor, &segment.owned, null, null);
+                    return;
+                },
                 .assign_ref => |assign| {
                     const step = try self.nextArcPlanStep(segment.plan_index, segment.cursor);
                     const any_views = self.dismantles.views.count() != 0;
@@ -5785,6 +5810,28 @@ const Inserter = struct {
         }
     }
 
+    /// The positions of a `suspend_save`'s saved operands whose units move
+    /// into the record: each refcounted unit the frame owns that no later
+    /// statement uses. The record takes every other saved operand by a
+    /// retain, so no saved operand decides its binding's mode.
+    fn savedTransferPositions(
+        self: *Inserter,
+        saved: LIR.LocalSpan,
+        next: LIR.CFStmtId,
+        owned: *OwnedSet,
+        transferred_positions: *std.ArrayList(u32),
+    ) ResourceError!void {
+        const locals = self.store.getLocalSpan(saved);
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
+            if (!self.localContainsRefcounted(local)) continue;
+            if (!self.ownsUnit(owned, local)) continue;
+            if (try self.groupUsedInPath(next, local)) continue;
+            try self.unsetOwnedUnit(owned, local);
+            try transferred_positions.append(self.lane_allocator, @intCast(i));
+        }
+    }
+
     /// Single-operand variant of `spanTransferMask` for tag payloads and
     /// packed captures.
     fn singleTransfer(
@@ -6357,7 +6404,11 @@ const Inserter = struct {
         const gpa = self.emission_allocator;
         const node = self.store.getCFStmt(stmt);
         switch (node) {
-            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+            .suspend_save => |save_stmt| {
+                try uses.append(gpa, save_stmt.task);
+                try self.appendSpanLocals(uses, self.store.stmtRow(save_stmt.data).saved);
+            },
+            .suspend_return => {},
             .assign_ref => |assign| switch (assign.op.kind) {
                 .local => if (assign.op.source != assign.target and !self.isBindingBorrowed(assign.target)) try uses.append(gpa, assign.op.source),
                 .discriminant => {},
@@ -6444,7 +6495,8 @@ const Inserter = struct {
     fn appendStmtWalkSuccessors(self: *Inserter, stmt: LIR.CFStmtId, out: *std.ArrayList(LIR.CFStmtId)) Allocator.Error!void {
         const gpa = self.emission_allocator;
         switch (self.store.getCFStmtImmediate(stmt).*) {
-            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+            .suspend_save => |save_stmt| try out.append(gpa, save_stmt.next),
+            .suspend_return => {},
             inline .assign_ref,
             .assign_literal,
             .init_uninitialized,
@@ -7547,7 +7599,11 @@ const Inserter = struct {
             if (body_clone.definedTarget(current)) |target| setReadBeforeRebindDef(&graph, node_index, target);
             const reads = &graph.nodes.items[node_index].reads;
             switch (current) {
-                .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
+                .suspend_save => |save_stmt| {
+                    try self.noteLivenessUseLocal(reads, save_stmt.task);
+                    try self.noteLivenessUseSpan(reads, self.store.stmtRow(save_stmt.data).saved);
+                },
+                .suspend_return => {},
                 .assign_ref => |assign| {
                     if (!self.solution.isRepresentationAlias(assign.target)) {
                         try self.noteLivenessUseRefOp(reads, assign.op);
@@ -10095,6 +10151,112 @@ test "ARC defers no erased call in a procedure that may suspend" {
         const inserted = try insert(&f.store, &f.layouts, .{});
         try testing.expectEqual(suspends == .never, inserted.deferred_erased_calls);
     }
+}
+
+/// Builds procedures that may suspend: each takes the task first and
+/// saves values into it for a body-less resume entry.
+const SuspendFixture = struct {
+    task: LIR.LocalId,
+    resume_entry: LIR.LirProcSpecId,
+
+    fn init(f: *ArcTest) Allocator.Error!SuspendFixture {
+        return .{
+            .task = try f.local(.opaque_ptr),
+            .resume_entry = try f.addBodylessProc(.zst),
+        };
+    }
+
+    fn save(self: SuspendFixture, f: *ArcTest, saved: []const LIR.LocalId, next: LIR.CFStmtId) Allocator.Error!LIR.CFStmtId {
+        return try f.store.addCFStmt(.{ .suspend_save = .{
+            .task = self.task,
+            .data = try f.store.addStmtRow(LIR.SuspendSaveData, .{
+                .proc = self.resume_entry,
+                .saved = try f.span(saved),
+                .capture_layout = .zst,
+                .on_drop = .none,
+                .slot_drop = .none,
+            }),
+            .next = next,
+        } }, .test_fixture);
+    }
+
+    fn paused(f: *ArcTest) Allocator.Error!LIR.CFStmtId {
+        return try f.store.addCFStmt(.suspend_return, .test_fixture);
+    }
+
+    fn addProc(self: SuspendFixture, f: *ArcTest, params: []const LIR.LocalId, body: LIR.CFStmtId) Allocator.Error!LIR.LirProcSpecId {
+        var args = std.ArrayList(LIR.LocalId).empty;
+        defer args.deinit(f.allocator);
+        try args.append(f.allocator, self.task);
+        try args.appendSlice(f.allocator, params);
+        const proc = try f.addProc(args.items, body, .zst);
+        f.store.getProcSpecPtr(proc).suspends = .may;
+        return proc;
+    }
+};
+
+test "ARC moves a saved value that dies at its suspend_save into the task record" {
+    // A saved operand is a borrowed occurrence; a unit the frame owns that
+    // dies there moves into the record with no retain and no release
+    // (design.md "The Continuation Pass").
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const suspension = try SuspendFixture.init(&f);
+    const list = try f.local(f.list_i64);
+    const save = try suspension.save(&f, &.{list}, try SuspendFixture.paused(&f));
+    _ = try suspension.addProc(&f, &.{}, try f.assignList(list, &.{}, save));
+
+    try f.run();
+
+    try testing.expectEqual(@as(usize, 0), f.countRc(list, .incref));
+    try testing.expectEqual(@as(usize, 0), f.countRc(list, .decref));
+}
+
+test "ARC retains a saved value the frame reads after its suspend_save" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const suspension = try SuspendFixture.init(&f);
+    const list = try f.local(f.list_i64);
+    const later_read = try f.expectStmt(list, try SuspendFixture.paused(&f));
+    const save = try suspension.save(&f, &.{list}, later_read);
+    _ = try suspension.addProc(&f, &.{}, try f.assignList(list, &.{}, save));
+
+    try f.run();
+
+    // The record takes a retain, and the frame releases its own unit after
+    // the later read.
+    try testing.expectEqual(@as(usize, 1), f.countRc(list, .incref));
+    try testing.expectEqual(@as(usize, 1), f.countRc(list, .decref));
+}
+
+test "ARC retains a saved parameter without demanding it owned" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const suspension = try SuspendFixture.init(&f);
+    const list = try f.local(f.list_i64);
+    const save = try suspension.save(&f, &.{list}, try SuspendFixture.paused(&f));
+    _ = try suspension.addProc(&f, &.{list}, save);
+
+    try f.run();
+
+    // Saving demands nothing of the parameter, so it stays borrowed and
+    // the record takes a retain of the caller's value.
+    try testing.expectEqual(@as(usize, 1), f.countRc(list, .incref));
+    try testing.expectEqual(@as(usize, 0), f.countRc(list, .decref));
+}
+
+test "ARC releases what a paused frame owns at suspend_return" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const suspension = try SuspendFixture.init(&f);
+    const list = try f.local(f.list_i64);
+    const save = try suspension.save(&f, &.{}, try SuspendFixture.paused(&f));
+    _ = try suspension.addProc(&f, &.{}, try f.assignList(list, &.{}, save));
+
+    try f.run();
+
+    try testing.expectEqual(@as(usize, 0), f.countRc(list, .incref));
+    try testing.expectEqual(@as(usize, 1), f.countRc(list, .decref));
 }
 
 test "ARC borrows an erased call's closure that is read after the call" {
