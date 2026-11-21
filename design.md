@@ -33535,15 +33535,21 @@ alone:
 - No rewrite makes a value maybe-uninitialized (`JoinExtra`'s
   `maybe_uninitialized_params`) where it is live across a suspension site.
 
-A site whose result the procedure returns unchanged (the call's next
-statement returns its target, directly or through jumps into join bodies) is
-a *tail site*. Its caller has nothing left to do, so it gets no pending test,
-no continuation and no record. While the task is pending the call's target
-holds no value, and the procedure returns it as it is, as a statement that
-hands a pending erased call up does; the pause passes straight up to the
-caller's caller. Since nothing but ARC's releases comes between the call and
-its return, ARC can still make it frame-replacing, so tail cycles stay
-constant-space while paused.
+A site whose callee is a procedure and whose result the procedure returns
+unchanged (the call's next statement returns its target, directly or by
+setting a join parameter to it and jumping to a join body that returns that
+parameter) is a *tail site*. Its caller has nothing left to do, so it gets
+no pending test, no continuation and no record. While the task is pending
+the call's target holds no value, and the procedure returns it as it is, as
+a statement that hands a pending erased call up does; the pause passes
+straight up to the caller's caller. Since nothing but ARC's releases comes
+between the call and its return, ARC can still make it frame-replacing, so
+tail cycles stay constant-space while paused.
+
+A hosted site is never a tail site. The host reports a pause only through
+the `RocPoll` it returns, and the result arrives later in the task's hosted
+slot, so the site always needs its pending test, which sets the pending
+flag, and a continuation that carries the result on.
 
 A procedure that may suspend returns an owned result, as a resume entry's
 erased-callable return is, so no retain of a borrowed result can come between
