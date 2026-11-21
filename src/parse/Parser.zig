@@ -2369,6 +2369,20 @@ fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.I
         );
     }
 
+    // `concurrency` is contextual, so it stays usable as an identifier.
+    var concurrency: ?Token.Idx = null;
+    if (self.peek() == .LowerIdent and std.mem.eql(u8, self.tokenText(self.pos), "concurrency")) {
+        self.advance();
+        self.expect(.OpColon) catch {
+            return try self.pushMalformed(AST.Header.Idx, .expected_concurrency_colon, self.pos);
+        };
+        if (self.peek() != .UpperIdent) {
+            return try self.pushMalformed(AST.Header.Idx, .expected_concurrency_mode, self.pos);
+        }
+        concurrency = self.pos;
+        self.advance();
+    }
+
     var targets: ?AST.TargetsSection.Idx = null;
     if (self.peek() == .KwTargets) {
         self.advance();
@@ -2384,6 +2398,7 @@ fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.I
         .roc_version = try self.takeRocVersionField(packages, null),
         .provides = provides,
         .hosted = hosted,
+        .concurrency = concurrency,
         .targets = targets,
         .region = .{ .start = start, .end = self.pos },
     } });
@@ -2597,6 +2612,7 @@ const StatementTypeAnnoState = struct {
     start: Token.Idx,
     name: Token.Idx,
     is_var: bool,
+    is_suspending: bool,
 };
 
 const StatementTypeDeclAnnoState = struct {
@@ -2612,6 +2628,7 @@ const StatementTypeAnnoAfterWhereState = struct {
     start: Token.Idx,
     name: Token.Idx,
     is_var: bool,
+    is_suspending: bool,
     anno: AST.TypeAnno.Idx,
 };
 
@@ -5640,6 +5657,7 @@ fn runExprStatementKernel(
                                 .start = state.start,
                                 .name = state.name,
                                 .is_var = state.is_var,
+                                .is_suspending = state.is_suspending,
                                 .anno = completed,
                             });
                             where_state = .{ .start = where_start, .scratch_top = self.store.scratchTop(AST.WhereClause) };
@@ -5650,6 +5668,7 @@ fn runExprStatementKernel(
                             .name = state.name,
                             .where = null,
                             .is_var = state.is_var,
+                            .is_suspending = state.is_suspending,
                             .region = .{ .start = state.start, .end = self.pos },
                         } });
                         continue :expr_kernel .statement_complete;
@@ -6127,6 +6146,7 @@ fn runExprStatementKernel(
                             .name = state.name,
                             .where = completed,
                             .is_var = state.is_var,
+                            .is_suspending = state.is_suspending,
                             .region = .{ .start = state.start, .end = self.pos },
                         } });
                         continue :expr_kernel .statement_complete;
@@ -6296,6 +6316,27 @@ fn runExprStatementKernel(
                             .start = start,
                             .name = start,
                             .is_var = false,
+                            .is_suspending = false,
+                        });
+                        type_args = .not_looking_for_args;
+                        continue :expr_kernel .type_prefix;
+                    } else if (tok == .LowerIdent and next_tok == .LowerIdent and
+                        statement_type != .in_body and
+                        self.peekN(2) == .OpColon and
+                        std.mem.eql(u8, self.tokenText(start), "suspending"))
+                    {
+                        // `suspending` is contextual: it marks a declaration
+                        // only when an annotated name follows it, so it stays
+                        // usable as an identifier.
+                        self.advance();
+                        const name = self.pos;
+                        self.advance();
+                        self.advance();
+                        try open_syntax.pushType(open_allocator, .statement_type_after_anno, StatementTypeAnnoState, .{
+                            .start = start,
+                            .name = name,
+                            .is_var = false,
+                            .is_suspending = true,
                         });
                         type_args = .not_looking_for_args;
                         continue :expr_kernel .type_prefix;
@@ -6461,6 +6502,7 @@ fn runExprStatementKernel(
                             .start = start,
                             .name = name,
                             .is_var = true,
+                            .is_suspending = false,
                         });
                         type_args = .not_looking_for_args;
                         continue :expr_kernel .type_prefix;

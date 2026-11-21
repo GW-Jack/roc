@@ -634,7 +634,7 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             node.tag = .platform_header;
             node.main_token = platform.name;
 
-            const ed_start = try store.reserveExtraDataStart(17);
+            const ed_start = try store.reserveExtraDataStart(18);
             // Store requires_entries span (start and len)
             store.extra_data.appendAssumeCapacity(platform.requires_entries.span.start);
             store.extra_data.appendAssumeCapacity(platform.requires_entries.span.len);
@@ -655,9 +655,10 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             store.extra_data.appendAssumeCapacity(try packOptionalIndex(platform.roc_version));
             store.extra_data.appendAssumeCapacity(platform.requires_entries.region.start);
             store.extra_data.appendAssumeCapacity(platform.requires_entries.region.end);
+            store.extra_data.appendAssumeCapacity(try packOptionalToken(platform.concurrency));
 
             node.data.lhs = ed_start;
-            node.data.rhs = 17;
+            node.data.rhs = 18;
 
             node.region = platform.region;
         },
@@ -846,11 +847,11 @@ pub fn addStatement(store: *NodeStore, statement: AST.Statement) std.mem.Allocat
             node.region = a.region;
             node.data.lhs = a.name;
             node.data.rhs = @backingInt(a.anno);
-            if (a.where != null or a.is_var) {
+            if (a.where != null or a.is_var or a.is_suspending) {
                 node.main_token = try store.reserveExtraDataToken(3);
                 store.extra_data.appendAssumeCapacity(@intFromBool(a.where != null));
                 store.extra_data.appendAssumeCapacity(if (a.where) |w| @backingInt(w) else 0);
-                store.extra_data.appendAssumeCapacity(@intFromBool(a.is_var));
+                store.extra_data.appendAssumeCapacity(@as(u32, @intFromBool(a.is_var)) | (@as(u32, @intFromBool(a.is_suspending)) << 1));
             } else {
                 node.main_token = 0;
             }
@@ -1486,7 +1487,7 @@ pub fn getHeader(store: *const NodeStore, header_idx: AST.Header.Idx) AST.Header
         inline .module_header, .hosted_header, .type_module_header, .default_app_header, .malformed => |t| return store.slotValue(AST.Header, header_shapes, t, node),
         .platform_header => {
             const ed_start = node.data.lhs;
-            std.debug.assert(node.data.rhs == 17);
+            std.debug.assert(node.data.rhs == 18);
 
             const symbol_map_layouts = store.extra_data.items[ed_start + 12];
             const targets_val = store.extra_data.items[ed_start + 13];
@@ -1519,6 +1520,7 @@ pub fn getHeader(store: *const NodeStore, header_idx: AST.Header.Idx) AST.Header
                     .start = store.extra_data.items[ed_start + 10],
                     .end = store.extra_data.items[ed_start + 11],
                 }, .layout = @fromBackingInt(@intCast((symbol_map_layouts >> 8) & 0xff)) },
+                .concurrency = unpackOptionalToken(store.extra_data.items[ed_start + 17]),
                 .targets = targets,
                 .region = node.region,
             } };
@@ -1693,12 +1695,15 @@ pub fn getStatement(store: *const NodeStore, statement_idx: AST.Statement.Idx) A
         .type_anno => {
             var where_clause: ?AST.Collection.Idx = null;
             var is_var = false;
+            var is_suspending = false;
             if (node.main_token != 0) {
                 const extra_start = extraDataStart(node.main_token);
                 if (store.extra_data.items[extra_start] != 0) {
                     where_clause = @fromBackingInt(@intCast(store.extra_data.items[extra_start + 1]));
                 }
-                is_var = store.extra_data.items[extra_start + 2] != 0;
+                const flags = store.extra_data.items[extra_start + 2];
+                is_var = flags & 1 != 0;
+                is_suspending = flags & 2 != 0;
             }
             return .{ .type_anno = .{
                 .region = node.region,
@@ -1706,6 +1711,7 @@ pub fn getStatement(store: *const NodeStore, statement_idx: AST.Statement.Idx) A
                 .anno = @fromBackingInt(@intCast(node.data.rhs)),
                 .where = where_clause,
                 .is_var = is_var,
+                .is_suspending = is_suspending,
             } };
         },
         .file_import => {

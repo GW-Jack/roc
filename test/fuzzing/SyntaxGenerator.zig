@@ -191,6 +191,14 @@ fn writePlatformHeader(self: *Self) std.mem.Allocator.Error!void {
         try self.writeSymbolMap();
     }
     if (self.reader.boolean()) {
+        try self.write(switch (self.choose(3)) {
+            0 => "\n    concurrency: None",
+            1 => "\n    concurrency: Tasks",
+            2 => "\n    concurrency: ParallelTasks",
+            else => unreachable,
+        });
+    }
+    if (self.reader.boolean()) {
         try self.write("\n    targets: {");
         const target_count = self.choose(3);
         for (0..target_count) |index| {
@@ -283,7 +291,7 @@ fn writeTopLevelStatement(self: *Self, depth: u8) std.mem.Allocator.Error!void {
         0 => try self.writeImport(),
         1 => try self.writeTypeDecl(depth),
         2 => try self.writeWhereAlias(depth),
-        3 => try self.writeTypeAnnoStatement(depth),
+        3 => try self.writeTypeAnnoStatement(depth, .declaration),
         4 => {
             try self.write("expect ");
             try self.writeExpr(depth);
@@ -387,8 +395,13 @@ fn writeWhereClause(self: *Self, receiver: Symbol, depth: u8) std.mem.Allocator.
     try self.write("]");
 }
 
-fn writeTypeAnnoStatement(self: *Self, depth: u8) std.mem.Allocator.Error!void {
+/// Where an annotation statement sits: only a top-level or associated
+/// declaration may carry the `suspending` marker.
+const AnnoStatementPosition = enum { declaration, body };
+
+fn writeTypeAnnoStatement(self: *Self, depth: u8, position: AnnoStatementPosition) std.mem.Allocator.Error!void {
     if (self.reader.boolean()) {
+        if (position == .declaration and self.choose(4) == 0) try self.write("suspending ");
         try self.writeEffectful(self.fresh(.function));
     } else {
         try self.writeSymbol(self.fresh(.value));
@@ -425,7 +438,7 @@ fn writeBlockStatements(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocat
         try self.writeNewline();
         switch (kind) {
             .associated => switch (self.choose(3)) {
-                0 => try self.writeTypeAnnoStatement(depth -| 1),
+                0 => try self.writeTypeAnnoStatement(depth -| 1, .declaration),
                 1 => try self.writeTypeDecl(depth -| 1),
                 else => try self.writeDecl(depth -| 1),
             },
@@ -491,7 +504,7 @@ fn writeBodyStatement(self: *Self, depth: u8, kind: BlockKind, first: bool) std.
             try self.writeBlockStatements(depth, .loop_body);
             try self.write("}");
         },
-        9 => try self.writeTypeAnnoStatement(depth),
+        9 => try self.writeTypeAnnoStatement(depth, .body),
         10 => {
             try self.write("if ");
             try self.writeExpr(depth);

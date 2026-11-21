@@ -545,6 +545,8 @@ fn parseReport(ctx: ParseReportContext) Allocator.Error!reporting.Report {
         .expected_symbol_map_function => reportParseProblem(ctx, "Expected Roc Function", "I was parsing a host symbol map entry, and I expected a Roc function name.", "The right side of a host symbol entry must be a lowercase function name, optionally qualified by a module path.", .{ .example = "\"roc_main\": Platform.main!" }),
         .expected_hosted_open_curly => reportParseProblem(ctx, "Expected Hosted Map", "I was parsing a `hosted` section, and I expected an opening `{`.", "Hosted symbol mappings are written inside braces.", .{ .example = "hosted { \"roc_stdout_line\": Stdout.line! }" }),
         .expected_hosted_close_curly => reportParseProblem(ctx, "Expected Closing Brace", "I was parsing a `hosted` section, and I expected a closing `}`.", "Close the hosted symbol map after the final host function mapping.", .{ .example = "hosted { \"roc_stdout_line\": Stdout.line! }" }),
+        .expected_concurrency_colon => reportParseProblem(ctx, "Expected Concurrency Colon", "I was parsing a `concurrency` field in a platform header, and I expected `:` after `concurrency`.", "The concurrency field names the platform's concurrency mode after a colon.", .{ .example = "concurrency: Tasks" }),
+        .expected_concurrency_mode => reportParseProblem(ctx, "Expected Concurrency Mode", "I was parsing a `concurrency` field in a platform header, and I expected a mode name.", "A concurrency mode is an uppercase name such as `Tasks`.", .{ .example = "concurrency: Tasks" }),
         .expected_requires => reportParseProblem(ctx, "Expected Requires", "I was parsing a platform header, and I expected the `requires` section.", "A platform header must state which entrypoints the app must provide.", .{ .example = "requires { main : {} => I32 }" }),
         .expected_requires_rigids_open_curly => reportParseProblem(ctx, "Expected Requires Entries", "I was parsing a `requires` section, and I expected an opening `{`.", "Required entrypoints are written inside braces after `requires`.", .{ .example = "requires { main : {} => I32 }" }),
         .expected_requires_signatures_close_curly => reportParseProblem(ctx, "Expected Closing Brace", "I was parsing a `requires` section, and I expected a closing `}`.", "Close the requires record after the final entrypoint signature.", .{ .example = "requires { main : {} => I32 }" }),
@@ -684,6 +686,8 @@ pub const Diagnostic = struct {
         expected_symbol_map_function,
         expected_hosted_open_curly,
         expected_hosted_close_curly,
+        expected_concurrency_colon,
+        expected_concurrency_mode,
         expected_requires,
         expected_requires_rigids_open_curly,
         expected_requires_signatures_close_curly,
@@ -1150,6 +1154,9 @@ pub const Statement = union(enum) {
         anno: TypeAnno.Idx,
         where: ?Collection.Idx,
         is_var: bool,
+        /// Written `suspending name : ...`: a hosted function that may pause
+        /// its task. Canonicalization decides where the marker is allowed.
+        is_suspending: bool,
         region: TokenizedRegion,
     },
     malformed: struct {
@@ -1350,6 +1357,7 @@ pub const Statement = union(enum) {
             .type_anno => |a| {
                 const begin = try ast.beginSexprNodeAt(env, tree, "s-type-anno", a.region);
                 try tree.pushStringPair("name", ast.resolve(a.name));
+                if (a.is_suspending) try tree.pushBoolPair("suspending", true);
                 const attrs = tree.beginNode();
 
                 try ast.store.getTypeAnno(a.anno).pushToSExprTree(gpa, env, ast, tree);
@@ -1865,6 +1873,9 @@ pub const Header = union(enum) {
         roc_version: ?RecordField.Idx,
         provides: SymbolMapEntry.Span, // provides { "roc_main": main_for_host! }
         hosted: SymbolMapEntry.Span, // hosted { "roc_stdout_line": Stdout.line! }
+        /// The mode token of `concurrency: Tasks`, two tokens after the
+        /// contextual field name. Canonicalization decides which modes exist.
+        concurrency: ?Token.Idx,
         targets: ?TargetsSection.Idx, // Required for new platforms, optional during migration
         region: TokenizedRegion,
     },
@@ -1987,6 +1998,7 @@ pub const Header = union(enum) {
                 const begin = try ast.beginSexprNodeAt(env, tree, "platform", a.region);
                 try tree.pushStringPair("name", ast.resolve(a.name));
                 try pushRocVersionToSExprTree(a.roc_version, ast, tree);
+                if (a.concurrency) |mode| try tree.pushStringPair("concurrency", ast.resolve(mode));
                 const attrs = tree.beginNode();
 
                 // Requires Entries (for-clause syntax)

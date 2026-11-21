@@ -119,6 +119,7 @@ test "NodeStore round trip - Headers" {
             .provides = .{ .span = rand_span(random), .layout = .expanded },
             .hosted = .{ .span = rand_span(random), .layout = .expanded },
             .requires_entries = .{ .span = .{ .start = 0, .len = 0 } },
+            .concurrency = rand_token_idx(random),
             .targets = null,
             .roc_version = @fromBackingInt(@intCast(3)),
             .region = rand_region(random),
@@ -354,6 +355,7 @@ test "NodeStore round trip - Statement" {
             .anno = rand_idx(random, AST.TypeAnno.Idx),
             .where = rand_idx(random, AST.Collection.Idx),
             .is_var = false,
+            .is_suspending = true,
             .region = rand_region(random),
         },
     });
@@ -390,6 +392,7 @@ test "NodeStore round trip - Statement type annotation full-width where index" {
             .anno = @fromBackingInt(@intCast(2)),
             .where = @fromBackingInt(@intCast(0x80000000)),
             .is_var = false,
+            .is_suspending = false,
             .region = .{ .start = 3, .end = 4 },
         } },
         .{ .type_anno = .{
@@ -397,6 +400,7 @@ test "NodeStore round trip - Statement type annotation full-width where index" {
             .anno = @fromBackingInt(@intCast(6)),
             .where = @fromBackingInt(@intCast(0xffffffff)),
             .is_var = true,
+            .is_suspending = false,
             .region = .{ .start = 7, .end = 8 },
         } },
     };
@@ -1287,6 +1291,7 @@ test "NodeStore rejects unaddressable extra data reservations in release builds"
             .provides = .{ .span = .{ .start = 0, .len = 0 } },
             .hosted = .{ .span = .{ .start = 0, .len = 0 } },
             .requires_entries = .{ .span = .{ .start = 0, .len = 0 } },
+            .concurrency = null,
             .targets = null,
             .roc_version = null,
             .region = .{ .start = 0, .end = 0 },

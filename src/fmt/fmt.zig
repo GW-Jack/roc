@@ -1092,6 +1092,9 @@ const Formatter = struct {
                     if (t.is_var) {
                         try fmt.pushAll(kw(.KwVar));
                         try fmt.continuationBoundary(t.name, f.indent);
+                    } else if (t.is_suspending) {
+                        try fmt.pushAll("suspending");
+                        try fmt.continuationBoundary(t.name, f.indent);
                     }
                     try fmt.pushTokenText(t.name);
                     try fmt.indentedAfterOrSpace(multiline, t.name);
@@ -3977,6 +3980,16 @@ const Formatter = struct {
                     try fmt.pushAll(kw(.KwHosted));
                     try fmt.continuationBoundary(p.hosted.region.start, start_indent + 1);
                     try fmt.formatSymbolMapSection(p.hosted, fmt.curr_indent);
+                }
+
+                if (p.concurrency) |mode| {
+                    // `mode` follows the contextual `concurrency` and its `:`.
+                    try fmt.formatSectionBoundary(mode - 2, start_indent + 1);
+                    try fmt.pushAll("concurrency");
+                    try fmt.commentBoundary(mode - 1, false);
+                    try fmt.push(':');
+                    try fmt.continuationBoundary(mode, start_indent + 1);
+                    try fmt.pushTokenText(mode);
                 }
 
                 // Format targets section if present
