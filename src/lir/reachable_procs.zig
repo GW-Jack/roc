@@ -468,6 +468,11 @@ const Pass = struct {
                 data.proc = self.remapProc(data.proc);
                 packed_fn.data = try self.store.addStmtRow(LIR.PackedErasedFnData, data);
             },
+            .suspend_save => |*save| {
+                var data = self.store.stmtRow(save.data);
+                data.proc = self.remapProc(data.proc);
+                save.data = try self.store.addStmtRow(LIR.SuspendSaveData, data);
+            },
             .dyn => |*dyn| {
                 var op = self.store.stmtRow(dyn.data);
                 switch (op) {
@@ -496,6 +501,7 @@ const Pass = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -887,6 +893,7 @@ fn stmtRefs(store: *const LirStore, stmt: LIR.CFStmt) StmtRefs {
     switch (stmt) {
         .assign_call => |call| return .{ .procs = .{ call.proc, null } },
         .assign_packed_erased_fn => |packed_fn| return .{ .procs = .{ store.stmtRow(packed_fn.data).proc, null } },
+        .suspend_save => |save| return .{ .procs = .{ store.stmtRow(save.data).proc, null } },
         .dyn => |dyn| return switch (store.stmtRow(dyn.data)) {
             .closure => |closure| .{ .procs = .{ closure.proc, null } },
             .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .eq, .hash, .inspect, .call_erased, .view, .adapt => .{},
@@ -913,6 +920,7 @@ fn stmtRefs(store: *const LirStore, stmt: LIR.CFStmt) StmtRefs {
         .debug,
         .expect,
         .expect_err,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,
@@ -1301,4 +1309,62 @@ test "erased callable pruning frees evidence for fully and partly discarded sets
     try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[1].entries.len);
     try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[1].entries[0].template.?.evidence.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[1].entries[0].template.?.evidence_frames.len);
+}
+
+test "reachable proc pass follows a suspend_save resume entry" {
+    var result = try LirProgram.Result.init(std.testing.allocator, base.target.TargetUsize.native);
+    defer result.deinit();
+
+    // Unreferenced, so compaction must drop it and renumber the others.
+    const dead_body = try result.store.addCFStmt(.runtime_error, .test_fixture);
+    _ = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(9),
+        .args = LIR.LocalSpan.empty(),
+        .body = .some(dead_body),
+        .ret_layout = .zst,
+    }, .none);
+
+    // The resume entry is named only by the root's suspend_save.
+    const resume_body = try result.store.addCFStmt(.runtime_error, .test_fixture);
+    const resume_entry = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(8),
+        .args = LIR.LocalSpan.empty(),
+        .body = .some(resume_body),
+        .ret_layout = .zst,
+    }, .none);
+
+    const task = try result.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const saved = try result.store.addLocal(.{ .layout_idx = .u64 });
+    const paused = try result.store.addCFStmt(.suspend_return, .test_fixture);
+    const save = try result.store.addCFStmt(.{ .suspend_save = .{
+        .task = task,
+        .data = try result.store.addStmtRow(LIR.SuspendSaveData, .{
+            .proc = resume_entry,
+            .saved = try result.store.addLocalSpan(&.{saved}),
+            .capture_layout = .u64,
+            .on_drop = .none,
+            .slot_drop = .none,
+        }),
+        .next = paused,
+    } }, .test_fixture);
+    const root_proc = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(2),
+        .args = try result.store.addLocalSpan(&.{ saved, task }),
+        .body = .some(save),
+        .ret_layout = .zst,
+    }, .none);
+    try result.root_procs.append(std.testing.allocator, root_proc);
+
+    try run(&result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.store.procSpecCount());
+    const compact_root = result.store.getProcSpec(result.root_procs.items[0]);
+    const kept = result.store.getCFStmtImmediate(compact_root.body.get().?).suspend_save;
+    const kept_entry = result.store.stmtRow(kept.data).proc;
+    try std.testing.expect(kept_entry != result.root_procs.items[0]);
+    try std.testing.expect(result.store.getCFStmtImmediate(result.store.getProcSpec(kept_entry).body.get().?).* == .runtime_error);
+    try std.testing.expect(result.store.getCFStmtImmediate(kept.next).* == .suspend_return);
 }

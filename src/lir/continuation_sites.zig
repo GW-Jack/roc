@@ -159,6 +159,8 @@ fn isTailSite(
             .switch_initialized_payload,
             .str_match,
             .str_match_set,
+            .suspend_save,
+            .suspend_return,
             .crash,
             .join,
             => return false,
@@ -291,6 +293,8 @@ const Builder = struct {
                 .str_match,
                 .str_match_set,
                 .ret,
+                .suspend_save,
+                .suspend_return,
                 .crash,
                 => {
                     try body_clone.appendSuccessors(self.store, &successors, stmt_id, self.allocator);

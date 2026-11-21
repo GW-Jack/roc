@@ -187,6 +187,8 @@ const JoinScopes = struct {
                 .str_match_set,
                 .jump,
                 .ret,
+                .suspend_save,
+                .suspend_return,
                 .crash,
                 => {
                     successors.clearRetainingCapacity();
@@ -291,6 +293,8 @@ const ContinuationRewriter = struct {
             .str_match_set,
             .join,
             .ret,
+            .suspend_save,
+            .suspend_return,
             .crash,
             => return .none,
         }

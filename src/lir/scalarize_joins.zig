@@ -774,6 +774,8 @@ const Pass = struct {
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -1915,6 +1917,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -1987,6 +1991,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -2078,6 +2084,11 @@ const Pass = struct {
                     if (assign.capture) |capture| try self.noteUse(capture);
                     if (assign.reuse) |reuse| try self.noteUse(reuse);
                     try self.noteWrite(assign_stmt.target);
+                },
+                .suspend_save => |save_stmt| {
+                    try self.noteUse(save_stmt.task);
+                    const saved = self.store.getLocalSpan(self.store.stmtRow(save_stmt.data).saved);
+                    for (0..saved.len) |index| try self.noteUse(GuardedList.at(saved, index));
                 },
                 .assign_low_level => |assign| {
                     const args = self.store.getLocalSpan(assign.args);
@@ -2177,7 +2188,7 @@ const Pass = struct {
                     try self.noteUse(rc.cond);
                     try self.noteUse(rc.value);
                 },
-                .join, .jump, .runtime_error, .comptime_exhaustiveness_failed => {},
+                .join, .jump, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed => {},
             }
             try body_clone.appendSuccessorsInOrder(self.store, &self.stack, current, self.allocator, .{ .switch_edges = .arms_first });
         }

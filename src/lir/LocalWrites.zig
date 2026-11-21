@@ -93,6 +93,8 @@ pub fn reusesStorage(stmt: LIR.CFStmt) bool {
         .decref_if_initialized,
         .free,
         .jump,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         => false,

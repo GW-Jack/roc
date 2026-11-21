@@ -66,7 +66,7 @@ pub fn runProc(store: *LirStore, proc_id: LIR.LirProcSpecId, scratch_allocator: 
                 for (0..GuardedList.borrowLen(params)) |i| try definitions.put(GuardedList.at(params, i), null);
             },
             .switch_stmt => try switches.append(scratch_allocator, stmt_id),
-            .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
+            .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
         }
     }
 
@@ -98,7 +98,7 @@ fn carriesExpectation(store: *const LirStore, definitions: *const collections.De
                 .local => local = s.op.source,
                 .field, .discriminant, .tag_payload, .tag_payload_struct, .list_reinterpret, .nominal => return false,
             },
-            .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .join, .switch_stmt, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => return false,
+            .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .join, .switch_stmt, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => return false,
         }
     }
     return false;

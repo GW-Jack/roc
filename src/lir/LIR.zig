@@ -1441,6 +1441,28 @@ pub const ErasedCallData = struct {
     drive: PendingDrive = .none,
 };
 
+/// The fields of `CFStmt.suspend_save` other than its task and successor,
+/// stored out of line (see `StmtRowId`). Design.md "The Continuation Pass".
+pub const SuspendSaveData = struct {
+    /// The resume entry `R(f, k)`: an erased-callable procedure whose capture
+    /// is `saved`, in order, at `capture_layout`.
+    proc: LirProcSpecId,
+    /// The values live across the site. Each is saved: the record holds a
+    /// reference, but the operand is never a reason for its binding to be
+    /// owned.
+    saved: LocalSpan,
+    capture_layout: layout.Idx,
+    /// The record's drop: releases every saved value exactly once.
+    on_drop: ErasedCallableOnDrop,
+    /// Releases a hosted result the host already wrote to the task's hosted
+    /// slot when a parked task is cancelled instead of resumed: the RC helper
+    /// for the hosted result's layout. The runtime calls the record's slot
+    /// release as `fn(slot, record, ops)`, and code generation gives it an
+    /// adapter onto this helper. `none` at a procedure site and for a result
+    /// with nothing refcounted.
+    slot_drop: ErasedCallableOnDrop,
+};
+
 /// The fields of `CFStmt.assign_packed_erased_fn` other than its target and successor,
 /// stored out of line (see `StmtRowId`).
 pub const PackedErasedFnData = struct {
@@ -1887,6 +1909,17 @@ pub const CFStmt = union(enum) {
         /// nothing more.
         extra: StmtRowId(CrashExtra) = .none,
     },
+    /// Packs the resume entry in `data` over its saved values and pushes the
+    /// record onto `task`'s record chain (design.md "The Continuation Pass").
+    /// It has no target. Only the continuation pass makes it, on a pending
+    /// edge.
+    suspend_save: struct {
+        task: LocalId,
+        data: StmtRowId(SuspendSaveData),
+        next: CFStmtId,
+    },
+    /// Returns from a paused procedure without a result. This is terminal.
+    suspend_return: void,
 };
 
 /// The crash message of a `comptime_exhaustiveness_failed` statement. Every

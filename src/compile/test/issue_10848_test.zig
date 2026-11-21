@@ -106,6 +106,7 @@ fn expectCallBuiltRecordListSetHasNoRetain(
                 .init_uninitialized,
                 .assign_call_erased,
                 .assign_packed_erased_fn,
+                .suspend_save,
                 .assign_list,
                 .assign_struct,
                 .assign_tag,
@@ -123,6 +124,7 @@ fn expectCallBuiltRecordListSetHasNoRetain(
                 .crash,
                 .expect_err,
                 .runtime_error,
+                .suspend_return,
                 .comptime_exhaustiveness_failed,
                 => {},
             }

@@ -109,7 +109,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      chunk column, combined with the v79-v82 changes.
 /// v84: procedure specs record whether they may suspend (`suspends`), and
 ///      call extras mark suspension sites (`suspension_site`).
-pub const FORMAT_VERSION: u32 = 84;
+/// v85: `suspend_save` and `suspend_return` statements, and the
+///      `SuspendSaveData` row column.
+pub const FORMAT_VERSION: u32 = 85;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

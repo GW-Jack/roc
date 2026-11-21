@@ -60,6 +60,7 @@ pub const stmt_row_types = .{
     lir_defs.CrashExtra,
     lir_defs.DynOp,
     lir_defs.ProductShape,
+    lir_defs.SuspendSaveData,
 };
 
 /// Number of out-of-line statement row columns.
@@ -1417,6 +1418,8 @@ pub fn failureMeaning(self: *const Self, stmt: CFStmtId) ?lir_defs.FailureMeanin
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .incref,
         .decref,
@@ -2312,6 +2315,7 @@ pub fn noteStmtShapes(self: *Self, stmt: CFStmt) void {
         },
         .assign_call_erased => self.shapes.erased_call = true,
         .assign_packed_erased_fn => self.shapes.erased_pack = true,
+        .suspend_save => self.shapes.erased_pack = true,
         .init_uninitialized,
         .assign_ref,
         .assign_list,
@@ -2321,6 +2325,7 @@ pub fn noteStmtShapes(self: *Self, stmt: CFStmt) void {
         .debug,
         .expect,
         .expect_err,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,

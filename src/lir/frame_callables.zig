@@ -454,6 +454,8 @@ pub fn classifyUse(store: *const LirStore, stmt_id: CFStmtId, local: LocalId) Us
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .decref_if_initialized,
@@ -1212,6 +1214,7 @@ fn redirectFlowEdge(store: *LirStore, stmt_id: CFStmtId, from: CFStmtId, to: CFS
         .decref_if_initialized,
         .free,
         .dyn,
+        .suspend_save,
         => |*s| if (s.next == from) {
             s.next = to;
             moved = true;
@@ -1270,7 +1273,7 @@ fn redirectFlowEdge(store: *LirStore, stmt_id: CFStmtId, from: CFStmtId, to: CFS
         },
         // A jump's successor is its join's body, where the callable is
         // live exactly when it is live at the jump, so no death lies on it.
-        .jump, .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => {},
+        .jump, .ret, .crash, .expect_err, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed => {},
     }
     if (!moved) frameInvariant("a death edge that is not a flow edge of its statement");
 }
@@ -1371,6 +1374,8 @@ fn rewriteSites(allocator: Allocator, store: *LirStore, proc_id: ProcId, sites: 
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .decref_if_initialized,
@@ -2012,6 +2017,7 @@ const PackFixture = struct {
             out[len] = std.meta.activeTag(stmt);
             len += 1;
             current = switch (stmt) {
+                .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
                 inline .assign_packed_erased_fn, .assign_call, .assign_call_erased, .incref, .decref, .free, .assign_ref => |s| s.next,
                 .init_uninitialized,
                 .assign_literal,

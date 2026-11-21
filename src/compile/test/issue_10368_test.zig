@@ -18,6 +18,7 @@ fn retainReachesPrepare(
     var remaining = store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (store.getCFStmtImmediate(current).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_low_level => |assign| {
                 if (assign.op == .list_map_prepare_reuse) {
                     const args = store.getLocalSpan(assign.args);

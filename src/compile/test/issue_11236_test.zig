@@ -25,6 +25,7 @@ fn hasTerminalCheckedError(store: *const lir.LirStore) bool {
         var remaining = store.cfStmtCount() + 1;
         while (remaining > 0) : (remaining -= 1) {
             switch (store.getCFStmtImmediate(current).*) {
+                .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
                 .runtime_error => return true,
                 .crash => |crash| {
                     if (crash.msg == .literal and std.mem.eql(u8, store.getString(crash.msg.literal), "runtime error")) return true;

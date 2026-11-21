@@ -831,6 +831,13 @@ fn writeFailureContext(
                 context.append(" next={d}", .{@backingInt(a.next)});
             },
             inline .assign_literal, .assign_packed_erased_fn => |a| context.append(" target={d} next={d}", .{ @backingInt(a.target), @backingInt(a.next) }),
+            .suspend_save => |a| {
+                const saved = store.getLocalSpan(store.stmtRow(a.data).saved);
+                context.append(" task={d} saved=[", .{@backingInt(a.task)});
+                for (0..saved.len) |saved_index| context.append(" {d}", .{@backingInt(GuardedList.at(saved, saved_index))});
+                context.append(" ] next={d}", .{@backingInt(a.next)});
+            },
+            .suspend_return => {},
             .dyn => |a| {
                 const op = store.stmtRow(a.data);
                 if (a.target) |target| context.append(" target={d}", .{@backingInt(target)});
@@ -4144,6 +4151,7 @@ const Certifier = struct {
             const current_stmt = self.store.getCFStmtImmediate(current);
             if (first_visit) try self.erased_owners.noteStmt(self.store, self.layouts, current_stmt.*);
             switch (current_stmt.*) {
+                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
                 .assign_ref => |assign| {
                     try self.noteProcLocal(assign.target);
                     try self.noteProcLocal(body_clone.refOpSource(assign.op));
@@ -4383,6 +4391,8 @@ const Certifier = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -4549,6 +4559,7 @@ const Certifier = struct {
             }
             if (body_clone.definedTarget(current.*)) |target| self.setReadBeforeRebindDef(&graph, node_index, target);
             switch (current.*) {
+                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
                 .join => |join| {
                     try ensureReadBeforeRebindNode(&graph, &work, join.body);
                     try cache_roots.append(graph_allocator, join.body);
@@ -5789,6 +5800,7 @@ const Certifier = struct {
                 }
             }
             switch (stmt.*) {
+                .suspend_save, .suspend_return => base.invariant("ARC certifier: {s}", .{"suspend_save and suspend_return reach ARC only after ARC supports them"}),
                 .assign_ref => |assign| {
                     try self.validateResidualShellFields(&state, assign);
                     switch (assign.op.kind) {

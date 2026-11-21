@@ -184,6 +184,8 @@ fn collectCandidates(self: *Self, store: *const LirStore, root: CFStmtId, params
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,

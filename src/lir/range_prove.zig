@@ -3551,6 +3551,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -3733,6 +3735,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -3879,6 +3883,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -4021,6 +4027,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -5734,6 +5742,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -5774,6 +5784,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -5865,6 +5877,8 @@ const Pass = struct {
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -7157,7 +7171,7 @@ const Pass = struct {
                         if (s.target) |target| try self.bindFresh(target);
                         current = s.next;
                     },
-                    inline .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |s| {
+                    inline .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .suspend_save => |s| {
                         try self.visited.put(current, {});
                         current = s.next;
                     },
@@ -7217,7 +7231,7 @@ const Pass = struct {
                         }
                         break :walk;
                     },
-                    .ret, .crash, .runtime_error, .expect_err, .comptime_exhaustiveness_failed => {
+                    .ret, .crash, .suspend_return, .runtime_error, .expect_err, .comptime_exhaustiveness_failed => {
                         try self.visited.put(current, {});
                         break :walk;
                     },
@@ -8857,6 +8871,8 @@ const RangeProveCertify = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,

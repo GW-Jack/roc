@@ -1245,7 +1245,7 @@ pub const Builder = struct {
     /// The local a straight-line statement defines, if any.
     fn definedLocal(stmt: LIR.CFStmt) ?LocalId {
         return switch (stmt) {
-            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => |payload| blk: {
+            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => |payload| blk: {
                 const Payload = @TypeOf(payload);
                 if (@typeInfo(Payload) != .@"struct" or !@hasField(Payload, "target")) break :blk null;
                 if (@TypeOf(payload.target) != LocalId) break :blk null;
@@ -1284,6 +1284,7 @@ pub const Builder = struct {
             .assign_call,
             .assign_call_erased,
             .assign_packed_erased_fn,
+            .suspend_save,
             .assign_low_level,
             .assign_list,
             .assign_struct,
@@ -1299,7 +1300,7 @@ pub const Builder = struct {
             .free,
             .dyn,
             => |*s| s.next = next,
-            .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => invariant("asked to link the successor of a non-linear statement"),
+            .expect_err, .runtime_error, .suspend_return, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => invariant("asked to link the successor of a non-linear statement"),
         }
     }
 
@@ -8945,7 +8946,7 @@ pub const Builder = struct {
                 }
                 op.target = result;
             },
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return false,
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return false,
         }
         try self.store.replaceCFStmt(last, stmt, self.store.stmtOrigin(last));
         const index = std.mem.findScalarLast(LocalId, self.frame_locals.items, value) orelse unreachable; // addLocal records every local a statement targets

@@ -776,6 +776,7 @@ fn countDebugEffectStmts(lowered: *const lir.CheckedPipeline.LoweredProgram) Deb
     var counts = DebugEffectCounts{};
     for (lowered.lir_result.store.getCFStmts()) |stmt| {
         switch (stmt) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .debug => counts.debug += 1,
             .expect => counts.expect += 1,
             .init_uninitialized,
@@ -1414,6 +1415,7 @@ fn collectAssignCallProcs(
         if (visited_entry.found_existing) continue;
 
         switch (lowered.lir_result.store.getCFStmtImmediate(stmt_id).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_ref => |stmt| try work.append(allocator, stmt.next),
             .assign_literal => |stmt| try work.append(allocator, stmt.next),
             .init_uninitialized => |stmt| try work.append(allocator, stmt.next),
@@ -5050,6 +5052,8 @@ test "LIR statements and procs carry resolved source locations" {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .switch_stmt,
@@ -5634,6 +5638,7 @@ fn collectLirResultProcShape(
         if (visited_entry.found_existing) continue;
 
         switch (result.store.getCFStmtImmediate(stmt_id).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_ref => |stmt| try work.append(allocator, stmt.next),
             .assign_literal => |stmt| try work.append(allocator, stmt.next),
             .init_uninitialized => |stmt| try work.append(allocator, stmt.next),
@@ -11780,6 +11785,7 @@ fn recordFieldReadCounts(
     var steps: usize = 0;
     while (steps < 4096) : (steps += 1) {
         switch (store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_ref => |stmt| {
                 switch (stmt.op.kind) {
                     .local => if (aliases.contains(stmt.op.source)) try aliases.put(stmt.target, {}),
@@ -11924,7 +11930,7 @@ fn fieldReadRetainCount(
                     }
                     try stack.append(allocator, stmt.next);
                 },
-                inline .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .dyn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .decref, .decref_if_initialized, .free => |stmt| {
+                inline .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .dyn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .decref, .decref_if_initialized, .free => |stmt| {
                     try stack.append(allocator, stmt.next);
                 },
                 .switch_stmt => |stmt| {
@@ -11956,6 +11962,7 @@ fn fieldReadRetainCount(
                 },
                 .expect_err,
                 .runtime_error,
+                .suspend_return,
                 .comptime_exhaustiveness_failed,
                 .jump,
                 .ret,
@@ -12971,7 +12978,7 @@ fn listSetCounts(store: *const lir.LirStore, proc_id: LIR.LirProcSpecId) ListSet
                     top += 1;
                 }
             },
-            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .dyn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |stmt| {
+            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .dyn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |stmt| {
                 if (top < cursor_stack.len) {
                     cursor_stack[top] = stmt.next;
                     top += 1;
@@ -13005,6 +13012,7 @@ fn listSetCounts(store: *const lir.LirStore, proc_id: LIR.LirProcSpecId) ListSet
             },
             .expect_err,
             .runtime_error,
+            .suspend_return,
             .comptime_exhaustiveness_failed,
             .switch_initialized_payload,
             .str_match,
@@ -15032,7 +15040,7 @@ test "provenance: ARC RC statements state their subject, reason, and deciding lo
                     try std.testing.expect(store.stmtLoc(stmt_id).hasLocation());
                     decrefs += 1;
                 },
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .dyn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => try std.testing.expect(!kind.isArcInserted()),
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .dyn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => try std.testing.expect(!kind.isArcInserted()),
             }
         }
     }

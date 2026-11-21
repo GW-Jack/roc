@@ -433,6 +433,21 @@ const Printer = struct {
                     try writer.writeAll("\n");
                     current = s.next;
                 },
+                .suspend_save => |s_stmt| {
+                    const s = self.store.stmtRow(s_stmt.data);
+                    try writeIndent(indent, writer);
+                    try writer.print("suspend_save task=l{d} p{d} [", .{ @backingInt(s_stmt.task), @backingInt(s.proc) });
+                    try self.writeLocals(s.saved, writer);
+                    try writer.writeAll("] capture_layout=");
+                    try writeLayout(self.layouts, s.capture_layout, writer);
+                    try writer.print(" on_drop={s} slot_drop={s}\n", .{ @tagName(s.on_drop), @tagName(s.slot_drop) });
+                    current = s_stmt.next;
+                },
+                .suspend_return => {
+                    try writeIndent(indent, writer);
+                    try writer.writeAll("suspend_return\n");
+                    return;
+                },
                 .runtime_error => {
                     try writeIndent(indent, writer);
                     try writer.writeAll("runtime_error\n");
@@ -723,4 +738,50 @@ test "proc fingerprint ignores program numbering but not content" {
     const first_print = try procFingerprint(allocator, &first, &layouts, first_proc);
     try std.testing.expectEqual(first_print, try procFingerprint(allocator, &second, &layouts, second_proc));
     try std.testing.expect(first_print != try procFingerprint(allocator, &other_callee, &layouts, other_proc));
+}
+
+test "debug print shows a suspend_save and its suspend_return" {
+    const allocator = std.testing.allocator;
+    var layouts = try layout_mod.Store.init(allocator, .u64);
+    defer layouts.deinit();
+    var store = LirStore.init(allocator);
+    defer store.deinit();
+
+    const resume_entry = try store.addProcSpec(.{
+        .name = .none,
+        .identity = LIR.ProcIdentity.forTest(4),
+        .args = .empty(),
+        .body = .none,
+        .ret_layout = .zst,
+    }, .none);
+    const task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const saved = try store.addLocal(.{ .layout_idx = .u64 });
+    const paused = try store.addCFStmt(.suspend_return, .test_fixture);
+    const save = try store.addCFStmt(.{ .suspend_save = .{
+        .task = task,
+        .data = try store.addStmtRow(LIR.SuspendSaveData, .{
+            .proc = resume_entry,
+            .saved = try store.addLocalSpan(&.{saved}),
+            .capture_layout = .u64,
+            .on_drop = .none,
+            .slot_drop = .none,
+        }),
+        .next = paused,
+    } }, .test_fixture);
+    const proc = try store.addProcSpec(.{
+        .name = .none,
+        .identity = LIR.ProcIdentity.forTest(1),
+        .args = try store.addLocalSpan(&.{ saved, task }),
+        .body = .some(save),
+        .ret_layout = .zst,
+    }, .none);
+
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    try writeProc(allocator, &store, &layouts, proc, &text.writer);
+    const expected_save = try std.fmt.allocPrint(allocator, "suspend_save task=l{d} p{d} [", .{ @backingInt(task), @backingInt(resume_entry) });
+    defer allocator.free(expected_save);
+    try std.testing.expect(std.mem.find(u8, text.written(), expected_save) != null);
+    try std.testing.expect(std.mem.find(u8, text.written(), "on_drop=none slot_drop=none\n") != null);
+    try std.testing.expect(std.mem.find(u8, text.written(), "  suspend_return\n") != null);
 }

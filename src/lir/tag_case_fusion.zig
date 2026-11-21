@@ -190,6 +190,8 @@ const BranchRewriter = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -273,7 +275,7 @@ const BranchRewriter = struct {
                 },
                 .local, .discriminant, .field, .list_reinterpret, .nominal => unreachable, // interceptStmt claims an assign_ref only for tag_payload and tag_payload_struct reads
             },
-            .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => unreachable, // interceptStmt claims only decref, decref_if_initialized, and assign_ref
+            .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => unreachable, // interceptStmt claims only decref, decref_if_initialized, and assign_ref
         }
     }
 };
@@ -454,6 +456,8 @@ fn debugCheckJumpScopes(store: *LirStore, proc: LIR.LirProcSpecId, fused_id: LIR
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -814,6 +818,8 @@ fn producerEdgeJump(
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .free,
@@ -922,6 +928,8 @@ const ArmRewrite = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -1341,6 +1349,8 @@ fn edgeStmt(store: *const LirStore, stmt_id: LIR.CFStmtId) struct { stmt: LIR.CF
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .free,

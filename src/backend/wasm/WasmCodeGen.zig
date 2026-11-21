@@ -3670,6 +3670,8 @@ fn planProcLocals(self: *Self, frame_locals: ProcLocalSpan, root: CFStmtId) Allo
             .expect,
             .expect_err,
             .dyn,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -8319,6 +8321,9 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
     self.operation_scratch_cursor = 0;
     defer self.operation_scratch_cursor = null;
     switch (stmt) {
+        // Milestone 1 implements suspension on the interpreter only
+        // (design.md "What Implements It First").
+        .suspend_save, .suspend_return => @panic("TODO: the wasm backend does not implement suspension yet"),
         .dyn => |dyn_stmt| {
             try self.generateDyn(dyn_stmt.target, self.store.stmtRow(dyn_stmt.data));
             try work.append(wa, .{ .node = .{ .stmt_id = dyn_stmt.next, .stop = stop } });

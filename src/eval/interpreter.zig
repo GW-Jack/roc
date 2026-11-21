@@ -2781,6 +2781,9 @@ pub const Interpreter = struct {
                     }
                     current = expect_stmt.next;
                 },
+                // Suspension needs the task runtime, which the interpreter gains with
+                // its test host (design.md "What Implements It First").
+                .suspend_save, .suspend_return => return self.triggerCrash("the interpreter does not implement suspension yet"),
                 .runtime_error => {
                     if (builtin.mode == .debug) {
                         debugPrint(

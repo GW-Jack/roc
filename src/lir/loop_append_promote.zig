@@ -681,6 +681,8 @@ const Pass = struct {
                         .debug,
                         .expect,
                         .expect_err,
+                        .suspend_save,
+                        .suspend_return,
                         .runtime_error,
                         .comptime_exhaustiveness_failed,
                         .incref,
@@ -792,6 +794,8 @@ const Pass = struct {
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -1182,6 +1186,8 @@ const Pass = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -1723,7 +1729,7 @@ const Pass = struct {
                 if (body_region.contains(entry.key_ptr.*)) return false;
                 switch (self.store.getCFStmtImmediate(entry.key_ptr.*).*) {
                     .set_local => |s| if (s.target == param) return false,
-                    .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
+                    .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
                 }
             }
         }
@@ -1779,7 +1785,7 @@ const Pass = struct {
                     .stmt = s.next,
                     .written = written or (s.mode == .initialize_join_param and s.target == param),
                 }),
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {
                     successors.clearRetainingCapacity();
                     try body_clone.appendSuccessorsInOrder(self.store, &successors, item.stmt, allocator, .{ .join_body = false });
                     for (successors.items) |successor| try work.append(allocator, .{ .stmt = successor, .written = written });
@@ -2879,8 +2885,8 @@ const Pass = struct {
         while (true) {
             switch (self.store.getCFStmtImmediate(current).*) {
                 .jump => return current,
-                inline .assign_ref, .assign_literal, .init_uninitialized, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |s| current = s.next,
-                .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => return null,
+                inline .assign_ref, .assign_literal, .init_uninitialized, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .suspend_save => |s| current = s.next,
+                .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash, .expect_err, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed => return null,
             }
         }
     }
@@ -2961,6 +2967,8 @@ const Pass = struct {
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -3069,7 +3077,7 @@ const Pass = struct {
             defer stmts.deinit();
             while (try stmts.next()) |stmt_id| switch (self.store.getCFStmt(stmt_id)) {
                 .join => |inner| try inner_joins.put(inner.id, inner.body),
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
             };
         }
 
@@ -3093,8 +3101,8 @@ const Pass = struct {
                 },
                 // A join's body runs only when something jumps to it.
                 .join => |inner| try work.append(allocator, inner.remainder),
-                .ret, .crash, .runtime_error, .comptime_exhaustiveness_failed, .expect_err => ends.exit = true,
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set => try body_clone.appendSuccessors(self.store, &work, stmt_id, allocator),
+                .ret, .crash, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .expect_err => ends.exit = true,
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .suspend_save => try body_clone.appendSuccessors(self.store, &work, stmt_id, allocator),
             }
         }
         return ends;
@@ -3176,7 +3184,7 @@ const Pass = struct {
                         if (self.append_sites.contains(inner_id)) return false;
                     }
                 },
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
             }
         }
         return true;
@@ -3189,7 +3197,7 @@ const Pass = struct {
         while (try stmts.next()) |stmt_id| {
             switch (self.store.getCFStmtImmediate(stmt_id).*) {
                 .jump => |jump| if (jump.target == id) return true,
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {},
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {},
             }
         }
         return false;
@@ -3213,7 +3221,7 @@ const Pass = struct {
                     if (GuardedList.borrowLen(args) != 1) return current;
                     current = GuardedList.at(args, 0);
                 },
-                .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return current,
+                .init_uninitialized, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return current,
             }
         }
         return current;
@@ -3232,7 +3240,7 @@ const Pass = struct {
                 },
                 .f64_literal, .f32_literal, .dec_literal, .str_literal, .bytes_literal, .proc_ref, .static_data => null,
             },
-            .init_uninitialized, .assign_ref, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
+            .init_uninitialized, .assign_ref, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
         }
     }
 
@@ -3290,7 +3298,7 @@ const Pass = struct {
                     .jump => |jump| if (jump.target == join.id) {
                         back_edges += 1;
                     },
-                    .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .ret, .crash => {},
+                    .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .ret, .crash => {},
                 }
             }
         }
@@ -3307,7 +3315,7 @@ const Pass = struct {
                     current = inner.remainder;
                 },
                 inline .assign_ref, .assign_literal, .init_uninitialized, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |st| current = st.next,
-                .assign_call, .assign_call_erased, .assign_packed_erased_fn, .dyn, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => return null,
+                .assign_call, .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .suspend_return, .dyn, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => return null,
             }
         };
         const test_switch = self.store.getCFStmtImmediate(test_stmt).switch_stmt;
@@ -3329,7 +3337,7 @@ const Pass = struct {
         while (negations < 8) : (negations += 1) {
             const negation = switch (self.store.getCFStmtImmediate(cond_def).*) {
                 .assign_low_level => |st| if (st.op == .bool_not) st else break,
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => break,
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => break,
             };
             const negation_args = self.store.getLocalSpan(negation.args);
             if (GuardedList.borrowLen(negation_args) != 1) return null;
@@ -3339,7 +3347,7 @@ const Pass = struct {
         }
         const compare = switch (self.store.getCFStmtImmediate(cond_def).*) {
             .assign_low_level => |st| st,
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
         };
         const compare_args = self.store.getLocalSpan(compare.args);
         if (GuardedList.borrowLen(compare_args) != 2) return null;
@@ -3387,7 +3395,7 @@ const Pass = struct {
             const value_def = (defs.get(value_root) orelse return null).get() orelse return null;
             const step = switch (self.store.getCFStmtImmediate(value_def).*) {
                 .assign_low_level => |st| st,
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return null,
             };
             const step_direction: @FieldType(TripBound, "direction") = if (step.op == .num_int_add_wrap or step.op == .num_int_add_crash_on_overflow or step.op == .num_int_add_proven_cannot_overflow)
                 .up
@@ -3432,7 +3440,7 @@ const Pass = struct {
                             if (GuardedList.at(inner_params, i) == counter) direct_defs += 1;
                         }
                     },
-                    .store_struct, .store_tag, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
+                    .store_struct, .store_tag, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => {},
                 }
             }
         }
@@ -3841,6 +3849,8 @@ const VersionRewriter = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -3881,7 +3891,7 @@ const VersionRewriter = struct {
                     .next = cloned[0],
                 } }, origin);
             },
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join, switch_stmt and an answered query
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join, switch_stmt and an answered query
         }
     }
 };
@@ -3938,6 +3948,8 @@ const SlackVersionRewriter = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -3964,7 +3976,7 @@ const SlackVersionRewriter = struct {
     ) ResourceError!CFStmtId {
         const s = switch (stmt) {
             .join => |join| join,
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join
         };
         if (self.sites.get(old_id)) |site| {
             var next = cloned[0];
@@ -4691,6 +4703,7 @@ test "promote threads slack through an append-only loop" {
     var steps: u32 = 0;
     while (steps < 8) : (steps += 1) {
         switch (store.getCFStmtImmediate(dispatch_stmt).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_literal => |lit| dispatch_stmt = lit.next,
             .assign_low_level => |cmp| {
                 try testing.expect(cmp.op == .num_is_eq or cmp.op == .list_len);
@@ -4729,6 +4742,8 @@ test "promote threads slack through an append-only loop" {
                         .debug,
                         .expect,
                         .expect_err,
+                        .suspend_save,
+                        .suspend_return,
                         .runtime_error,
                         .comptime_exhaustiveness_failed,
                         .incref,
@@ -5235,7 +5250,7 @@ fn appendShapeOf(store: *LirStore, root: CFStmtId, head: LIR.JoinPointId, copy: 
                 if (s.target == head) shape.jumps_to_head += 1;
                 if (s.target == copy) shape.jumps_to_copy += 1;
             },
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {},
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .str_match_set, .join, .ret, .crash => {},
         }
     }
     return shape;
@@ -5517,6 +5532,8 @@ fn shapeOf(store: *LirStore, root: CFStmtId, head: LIR.JoinPointId, copy: LIR.Jo
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -5984,6 +6001,8 @@ test "promote measures a tail-recursive loop's argument at its entry and version
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,

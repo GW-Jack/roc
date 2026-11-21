@@ -308,6 +308,7 @@ pub fn forEachSuccessor(
         .assign_call,
         .assign_call_erased,
         .assign_packed_erased_fn,
+        .suspend_save,
         .assign_low_level,
         .assign_list,
         .assign_struct,
@@ -361,6 +362,7 @@ pub fn forEachSuccessor(
             visit(ctx, s.remainder);
         },
         .runtime_error,
+        .suspend_return,
         .comptime_exhaustiveness_failed,
         .expect_err,
         .jump,
@@ -388,6 +390,7 @@ pub fn redirectSuccessors(
         .assign_call,
         .assign_call_erased,
         .assign_packed_erased_fn,
+        .suspend_save,
         .assign_low_level,
         .assign_list,
         .assign_struct,
@@ -437,6 +440,7 @@ pub fn redirectSuccessors(
         .crash,
         .expect_err,
         .runtime_error,
+        .suspend_return,
         .comptime_exhaustiveness_failed,
         => {},
     }
@@ -556,6 +560,11 @@ pub fn forEachStmtRead(
             note(ctx, s.cond);
             note(ctx, s.value);
         },
+        .suspend_save => |inline_stmt| {
+            note(ctx, inline_stmt.task);
+            emitSpan(store, ctx, note, store.stmtRow(inline_stmt.data).saved);
+        },
+        .suspend_return,
         .init_uninitialized,
         .assign_literal,
         .join,
@@ -639,6 +648,8 @@ pub fn forEachStmtDef(
         .decref_if_initialized,
         .free,
         .jump,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         => {},
@@ -744,6 +755,8 @@ pub fn definedTarget(stmt: LIR.CFStmt) ?LocalId {
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,
@@ -780,6 +793,8 @@ pub fn writtenLocal(stmt: LIR.CFStmt) ?LocalId {
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,
@@ -1023,6 +1038,8 @@ pub const LoopCopyRewriter = struct {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -1049,7 +1066,7 @@ pub const LoopCopyRewriter = struct {
     ) Allocator.Error!CFStmtId {
         const s = switch (stmt) {
             .join => |join| join,
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for join
         };
         return try cloner.store.addCFStmt(.{ .join = .{
             .id = self.join_map.get(s.id).?,
@@ -1574,7 +1591,7 @@ fn readsBeforeDefining(
             },
             // A join's parameters are written by the jumps to it.
             .join => {},
-            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .ret, .crash => {
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .ret, .crash => {
                 if (stmtReadsLocal(store, stmt, local)) return true;
                 var defines = Defines{ .local = local };
                 forEachStmtDef(store, stmt, &defines, Defines.note);
@@ -1684,6 +1701,8 @@ pub fn visitStmtDefinitions(store: *const LirStore, defined: anytype, stmt_id: C
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,
@@ -2421,7 +2440,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                         if (frame.owns_run) switch (frame.source) {
                             .switch_stmt => self.branches.shrinkRetainingCapacity(frame.run_start),
                             .str_match_set => self.arms.shrinkRetainingCapacity(frame.run_start),
-                            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .join, .jump, .ret, .crash => {},
+                            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_initialized_payload, .str_match, .join, .jump, .ret, .crash => {},
                         };
                         frames.items.len -= 1;
                         returned = cloned;
@@ -2478,6 +2497,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                     .region = s.region,
                 } }, origin),
                 .runtime_error => try self.store.addCFStmt(.runtime_error, origin),
+                .suspend_return => try self.store.addCFStmt(.suspend_return, origin),
                 .comptime_exhaustiveness_failed => |s| try self.store.addCFStmt(.{ .comptime_exhaustiveness_failed = s }, origin),
                 .jump => |s| try self.cloneJump(s, origin),
                 .ret => |s| if (@hasDecl(Rewriter, "cloneRet"))
@@ -2491,7 +2511,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                     },
                     .extra = s.extra,
                 } }, origin),
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join => null,
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join => null,
             };
         }
 
@@ -2550,6 +2570,20 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                             .reuse = try self.mapMaybeLocal(s.reuse),
                             .reuse_unique = s.reuse_unique,
                             .frame = s.frame,
+                        }),
+                        .next = inline_stmt.next,
+                    } };
+                },
+                .suspend_save => |inline_stmt| blk: {
+                    const s = self.store.stmtRow(inline_stmt.data);
+                    break :blk .{ .suspend_save = .{
+                        .task = try self.mapLocal(inline_stmt.task),
+                        .data = try self.store.addStmtRow(LIR.SuspendSaveData, .{
+                            .proc = s.proc,
+                            .saved = try self.mapLocalSpan(s.saved),
+                            .capture_layout = s.capture_layout,
+                            .on_drop = s.on_drop,
+                            .slot_drop = s.slot_drop,
                         }),
                         .next = inline_stmt.next,
                     } };
@@ -2651,6 +2685,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                 .str_match_set,
                 .join,
                 .expect_err,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .jump,
@@ -2748,7 +2783,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                         },
                     };
                 },
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .jump, .ret, .crash => {
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .jump, .ret, .crash => {
                     if (step == 0) return .{ .clone = linearNext(frame.source) };
                     setLinearNext(&frame.built, returned.?);
                     return .{ .finished = try self.store.addCFStmt(frame.built, frame.origin) };
@@ -3114,8 +3149,10 @@ pub fn linearNextPtr(stmt: *LIR.CFStmt) ?*CFStmtId {
         .decref_if_initialized,
         .free,
         .dyn,
+        .suspend_save,
         => |*s| &s.next,
         .expect_err,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .switch_stmt,
@@ -3175,6 +3212,72 @@ test "subtree clone bridges renamed parameters before an external join" {
     try testing.expectEqual(cloned_param, bridge.value);
     try testing.expectEqual(LIR.SetLocalWriteMode.initialize_join_param, bridge.mode);
     try testing.expectEqual(external_id, store.getCFStmtImmediate(bridge.next).jump.target);
+}
+
+test "subtree clone copies a suspend_save and its suspend_return" {
+    const testing = std.testing;
+    var store = LirStore.init(testing.allocator);
+    defer store.deinit();
+
+    const task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const saved = try store.addLocal(.{ .layout_idx = .u64 });
+    const resume_entry = try store.addProcSpec(.{
+        .name = .none,
+        .identity = LIR.ProcIdentity.forTest(3),
+        .args = .empty(),
+        .body = .none,
+        .ret_layout = .zst,
+    }, .none);
+    const paused = try store.addCFStmt(.suspend_return, .test_fixture);
+    const save = try store.addCFStmt(.{ .suspend_save = .{
+        .task = task,
+        .data = try store.addStmtRow(LIR.SuspendSaveData, .{
+            .proc = resume_entry,
+            .saved = try store.addLocalSpan(&.{saved}),
+            .capture_layout = .u64,
+            .on_drop = .none,
+            .slot_drop = .none,
+        }),
+        .next = paused,
+    } }, .test_fixture);
+
+    var join_params = JoinParamIndex.init(testing.allocator);
+    defer join_params.deinit();
+    try join_params.indexReachable(&store, save);
+    var cloner = try BodyCloner(TestRetRewriter).initWithFreshDeclaredJoinsAndAllocator(&store, .{}, save, &join_params, testing.allocator);
+    defer cloner.deinit();
+    const cloned_id = try cloner.cloneStmt(save);
+    try testing.expect(cloned_id != save);
+
+    const original = store.getCFStmtImmediate(save).suspend_save;
+    const cloned = store.getCFStmtImmediate(cloned_id).suspend_save;
+    try testing.expect(cloned.data != original.data);
+    try testing.expect(cloned.next != paused);
+    try testing.expect(store.getCFStmtImmediate(cloned.next).* == .suspend_return);
+    // The clone's locals are renamed, keeping their layouts.
+    const row = store.stmtRow(cloned.data);
+    const cloned_saved = GuardedList.at(store.getLocalSpan(row.saved), 0);
+    try testing.expect(cloned.task != task);
+    try testing.expect(cloned_saved != saved);
+    try testing.expectEqual(layout_mod.Idx.opaque_ptr, store.getLocal(cloned.task).layout_idx);
+    try testing.expectEqual(layout_mod.Idx.u64, store.getLocal(cloned_saved).layout_idx);
+    try testing.expectEqual(resume_entry, row.proc);
+    try testing.expectEqual(layout_mod.Idx.u64, row.capture_layout);
+
+    // Its operands are read, it defines nothing, and it falls through to
+    // `next`; the return has no successor.
+    var reads = std.ArrayList(LocalId).empty;
+    defer reads.deinit(testing.allocator);
+    const Collect = struct {
+        fn note(list: *std.ArrayList(LocalId), local: LocalId) void {
+            list.append(testing.allocator, local) catch @panic("OOM");
+        }
+    };
+    forEachStmtRead(&store, store.getCFStmt(save), &reads, Collect.note);
+    try testing.expectEqualSlices(LocalId, &.{ task, saved }, reads.items);
+    try testing.expectEqual(@as(?LocalId, null), definedTarget(store.getCFStmt(save)));
+    try testing.expectEqual(paused, linearNext(store.getCFStmt(save)));
+    try testing.expectEqual(@as(?CFStmtId, null), linearNextOrNull(store.getCFStmt(paused)));
 }
 
 test "chainIsSingleUse rejects an extra read of any link" {

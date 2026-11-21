@@ -504,8 +504,8 @@ fn hasSelfCall(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
                 }
                 try work.append(allocator, s.on_miss);
             },
-            .jump, .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => {},
-            inline .assign_ref, .assign_literal, .init_uninitialized, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |s| {
+            .jump, .ret, .crash, .expect_err, .runtime_error, .suspend_return, .comptime_exhaustiveness_failed => {},
+            inline .assign_ref, .assign_literal, .init_uninitialized, .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free => |s| {
                 try work.append(allocator, s.next);
             },
         }

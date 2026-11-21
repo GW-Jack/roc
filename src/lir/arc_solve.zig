@@ -1495,6 +1495,7 @@ pub fn findOutcomeRefinement(
     var cursor = next;
     while (true) {
         switch (store.getCFStmt(cursor)) {
+            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| switch (assign.op.kind) {
                 .local => {
                     if (discriminant != null) return null;
@@ -1766,6 +1767,7 @@ fn computeOutcomeRestitution(
                 }.go;
 
                 switch (stmt.*) {
+                    .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                     inline .assign_ref, .init_uninitialized => |assign| {
                         if (assign.target == active_param) {
                             valid = false;
@@ -2462,6 +2464,8 @@ fn liftProcStmtFacts(
         .debug,
         .expect,
         .expect_err,
+        .suspend_save,
+        .suspend_return,
         .runtime_error,
         .comptime_exhaustiveness_failed,
         .incref,
@@ -3130,6 +3134,7 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
     const store = solver.store;
     const allocator = solver.allocator;
     switch (store.getCFStmtImmediate(current).*) {
+        .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
         .assign_ref => |assign| {
             switch (assign.op.kind) {
                 .local => {
@@ -3816,6 +3821,8 @@ fn computeVisibilityFromLift(
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -3879,6 +3886,7 @@ fn computeVisibilityFromLift(
         if (!reachable.isSet(stmt_index)) continue;
         const stmt = store.getCFStmtImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(stmt_index)))));
         switch (stmt.*) {
+            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| {
                 const target = @backingInt(assign.target);
                 switch (assign.op.kind) {
@@ -6115,6 +6123,7 @@ fn computeUniquenessDetailed(
         } else reachable_iter.next() orelse break;
         const stmt = store.getCFStmt(@fromBackingInt(@intCast(@as(u32, @intCast(stmt_index)))));
         switch (stmt) {
+            .suspend_save, .suspend_return => solveInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| {
                 marks.trackDef(&has_def, &multi_def, assign.target);
                 const alias_of: ?LIR.LocalId = switch (assign.op.kind) {

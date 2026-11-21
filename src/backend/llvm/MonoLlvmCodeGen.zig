@@ -4019,6 +4019,7 @@ pub const MonoLlvmCodeGen = struct {
                 .assign_call,
                 .assign_call_erased,
                 .assign_packed_erased_fn,
+                .suspend_save,
                 .assign_low_level,
                 .assign_list,
                 .assign_struct,
@@ -4066,6 +4067,7 @@ pub const MonoLlvmCodeGen = struct {
                     try self.noteStmtIncoming(&stack, join_stmt.body);
                 },
                 .runtime_error,
+                .suspend_return,
                 .comptime_exhaustiveness_failed,
                 .jump,
                 .ret,
@@ -4323,6 +4325,7 @@ pub const MonoLlvmCodeGen = struct {
                 switch (self.store.getCFStmt(stmt_id)) {
                     .assign_call => |call| try succs.append(arena, @backingInt(call.proc)),
                     .assign_packed_erased_fn => |packed_fn| needs[@backingInt(self.store.stmtRow(packed_fn.data).proc)] = true,
+                    .suspend_save => |save| needs[@backingInt(self.store.stmtRow(save.data).proc)] = true,
                     .assign_literal => |literal| {
                         switch (literal.value) {
                             .proc_ref => |proc_id| needs[@backingInt(proc_id)] = true,
@@ -4334,7 +4337,7 @@ pub const MonoLlvmCodeGen = struct {
                     .dyn => |dyn_stmt| switch (self.store.stmtRow(dyn_stmt.data)) {
                         .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .eq, .hash, .inspect, .call_erased, .closure, .view, .adapt => {},
                     },
-                    .init_uninitialized, .assign_ref, .assign_call_erased, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
+                    .init_uninitialized, .assign_ref, .assign_call_erased, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
                 }
                 try lir.BodyClone.appendSuccessors(self.store, &work, stmt_id, arena);
             }
@@ -4367,7 +4370,7 @@ pub const MonoLlvmCodeGen = struct {
             switch (stmt) {
                 .join => |join| try joins.append(self.allocator, .{ .id = join.id, .body = join.body }),
                 .assign_call => |call| try shape.callees.append(self.allocator, call.proc),
-                .assign_call_erased, .assign_packed_erased_fn, .dyn => shape.opaque_call = true,
+                .assign_call_erased, .assign_packed_erased_fn, .suspend_save, .dyn => shape.opaque_call = true,
                 .init_uninitialized,
                 .assign_ref,
                 .assign_literal,
@@ -4381,6 +4384,7 @@ pub const MonoLlvmCodeGen = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -4615,6 +4619,9 @@ pub const MonoLlvmCodeGen = struct {
         try self.setStmtDebugLocation(stmt_id);
         try self.emitSlotLifetimeMarkers(stmt_id);
         switch (stmt) {
+            // Milestone 1 implements suspension on the interpreter only
+            // (design.md "What Implements It First").
+            .suspend_save, .suspend_return => @panic("TODO: the LLVM backend does not implement suspension yet"),
             .dyn => |dyn_stmt| {
                 try self.emitDyn(dyn_stmt.target, self.store.stmtRow(dyn_stmt.data));
                 try work.append(wa, .{ .node = dyn_stmt.next });
@@ -4917,7 +4924,7 @@ pub const MonoLlvmCodeGen = struct {
                     return;
                 },
                 .assign_call => {},
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return,
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => return,
             }
             const call = stmt.assign_call;
             if (codegen.store.stmtRowOrDefault(call.extra).replaces_frame) return;

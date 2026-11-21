@@ -89,6 +89,7 @@ const ProcScan = struct {
                 .assign_literal,
                 .init_uninitialized,
                 .assign_packed_erased_fn,
+                .suspend_save,
                 .assign_list,
                 .assign_struct,
                 .assign_tag,
@@ -107,6 +108,7 @@ const ProcScan = struct {
                 .crash,
                 .expect_err,
                 .runtime_error,
+                .suspend_return,
                 .comptime_exhaustiveness_failed,
                 => {},
             }

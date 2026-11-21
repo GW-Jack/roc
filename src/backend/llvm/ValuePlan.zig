@@ -1071,6 +1071,10 @@ fn noteAllAddressed(self: *Self, store: *const LirStore, stmt: lir.LIR.CFStmt) v
 fn noteAddressedOperands(self: *Self, store: *const LirStore, stmt: lir.LIR.CFStmt, ops: anytype) void {
     switch (stmt) {
         // Writes nothing: the local keeps whatever it held.
+        // The record holds each saved value; treat them as addressed until a
+        // backend implements suspension.
+        .suspend_save => self.noteAllAddressed(store, stmt),
+        .suspend_return => {},
         .init_uninitialized => {},
         .assign_ref => |assign| if (store.getLocal(assign.target).dyn != null) {
             self.noteAllAddressed(store, stmt);
