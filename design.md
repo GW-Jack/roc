@@ -33457,6 +33457,338 @@ The allowed replacement is explicit stage ownership:
   insertion
 - backends own only backend code generation from explicit LIR
 
+## Suspendable Effects
+
+A platform may let a hosted call finish later: the host returns before the
+result is ready, the Roc code that made the call pauses, and the host resumes
+it once the result has been written. This section is the compiler side of
+that. It covers one task at a time: a root that pauses at its hosted calls
+and resumes where it paused. Child tasks, concurrent loops and shared state
+build on it and are specified separately when they are implemented.
+
+A task pauses only at a *suspension site*, a call the compiler knows may
+return before its result is ready. Pausing saves, in a heap *record*, the
+values the caller still needs, and returns; every caller up to the task's
+entry does the same. The chain of records is the paused task. Resuming runs
+the innermost record's resume entry, which continues just after the call that
+paused, and passes its result to the next record out. Nothing before the call
+runs again. This is capture by unwinding (generalized stack inspection, the
+technique of Binaryen's Asyncify), restricted to the procedures that may
+reach a suspension site. Code that cannot reach one compiles exactly as it
+does without this section.
+
+All of it is explicit LIR made before ARC: tests of the task's state, saves,
+calls, returns and erased-callable values. ARC places every reference-count
+statement, including those that keep saved values alive, so backends, the
+interpreter and LirImage follow the output without knowing about suspension.
+
+### Explicit Inputs
+
+- **The platform's `concurrency` field**, `None` (the default when the field
+  is absent), `Tasks` or `ParallelTasks`. Checking records it on the
+  platform's checked output. It changes generated code in modules that never
+  import the platform, so it is part of the compilation key of every unit,
+  like the target.
+- **The `suspending` marker** on a hosted function declaration:
+
+  ```roc
+  Http := [].{
+      suspending get_utf8! : Str => Try(Str, [HttpErr(U16)])
+  }
+  ```
+
+  It is part of the declaring module's checked output, so every importer
+  sees it, and it reaches LIR on the hosted procedure (`hosted.Proc`). Only
+  effectful (`=>`) hosted declarations may carry it. A `suspending`
+  declaration in a program whose platform is not `concurrency: Tasks` is a
+  checking error. Both words are recognized only where they have this
+  meaning, so neither becomes a reserved word.
+- **Function types.** Roc has no effect polymorphism, so a pure procedure can
+  never reach a suspension site.
+
+With `concurrency: None` every hosted call completes before it returns, no
+procedure may suspend, and none of the passes below changes anything.
+
+### Suspendability
+
+A call is a *suspension site* when its callee is a `suspending` hosted
+procedure or a procedure that may suspend. A procedure *may suspend* when its
+body contains a suspension site. This is a whole-program fixpoint over direct
+calls; under `.lss` every call through a lambda set is a direct call, so the
+answer is exact. Each procedure records `LirProcSpec.suspends: never | may`,
+and each suspension site records it on its `CallExtra`. Later stages read
+these marks and never rediscover them.
+
+The marks are computed right after LIR construction, so the procedure-local
+rewrites can see them, and computed again from the rewritten LIR by the
+continuation pass, whose marks are the ones every later stage reads. The
+rewrites that would break suspension leave procedures that may suspend
+alone:
+
+- No procedure that may suspend gets a destination variant (`return_slot`,
+  `append_into`; see Destination-Passing Results and Allocation Reuse). A
+  destination is an address in the caller's frame, which may be gone by the
+  time the procedure writes its result.
+- TRMC does not apply its modulo-cons transformation to such a procedure,
+  since its hole pointers are frame addresses (`ptr_alloca`). Plain tail-call
+  elimination still applies.
+- No rewrite makes a value maybe-uninitialized (`JoinExtra`'s
+  `maybe_uninitialized_params`) where it is live across a suspension site.
+
+A site whose result the procedure returns unchanged (the call's next
+statement returns its target, directly or through jumps into join bodies) is
+a *tail site*. Its caller has nothing left to do, so it gets no pending test,
+no continuation and no record. While the task is pending the call's target
+holds no value, and the procedure returns it as it is, as a statement that
+hands a pending erased call up does; the pause passes straight up to the
+caller's caller. Since nothing but ARC's releases comes between the call and
+its return, ARC can still make it frame-replacing, so tail cycles stay
+constant-space while paused.
+
+A procedure that may suspend returns an owned result, as a resume entry's
+erased-callable return is, so no retain of a borrowed result can come between
+its call and the test that follows it. It solves no outcome-restitution rows
+(Outcome-Conditioned Argument Restitution), since a pending return has no
+outcome. The tail-drive pass marks every tail position of such a procedure
+`always`, so it never hands a pending erased call up and takes no caller's
+cell.
+
+When no hosted procedure is `suspending`, both computations commit `never`
+everywhere and walk nothing. A Debug compiler walks anyway and asserts that
+it finds no suspension site.
+
+### The Continuation Pass
+
+The continuation pass runs after `ReachableProcs` and before `ErasedOwner`,
+so erased-owner resolution, ARC and the certifier treat everything it makes
+as ordinary LIR. For every procedure that may suspend it does four things.
+
+**The task.** The procedure takes the current task as a hidden argument after
+its explicit arguments and before any hidden argument other passes add, and
+every suspension site passes it on. The task is a pointer with no reference
+count. Each call of a `suspending` hosted procedure is rewritten into the
+shape of the host contract below: it passes the task and the task's hosted
+result slot, its target is the returned `RocPoll`, and the statement after
+the test reads the hosted result out of the slot.
+
+**Continuations.** LIR's joins are lexically scoped, so a resume cannot jump
+into the middle of a body, and inside a loop it would enter the loop past its
+header. So for each site `k` of a procedure `f` that is not a tail site, the
+pass makes a *continuation procedure* `C(f, k)`. Its arguments are the
+values live after the call, the call's result when the code after the call
+reads it, and the task. A value is live when some path from the call reads
+it before writing it, and a join's `retained` locals count as read in its
+body. A hosted site's result is its `RocPoll`, which nothing reads after the
+test; its continuation begins with the read from the slot.
+
+The body of `C(f, k)` is a copy of the code that runs after the call: the
+rest of the statement chain, inside copies of the joins that enclose the
+site, so its jumps keep their targets, with every local renamed and every
+join's `JoinExtra` restated for the copy. Inside it, the ready path of every
+suspension site `j` (the site itself included, when a loop returns to it) is
+a call to `C(f, j)` with that site's live values and result, whose value the
+copy returns: a tail site. Code between sites is copied into each
+continuation that reaches it without crossing another site. Continuations
+that call each other in a cycle share an SCC, so ARC replaces the frame at
+each such call and a loop that runs after a resume runs in constant space;
+any other chain of continuations is no longer than the number of sites in
+`f`.
+
+**Resume entries.** For each such site the pass makes a *resume entry*
+`R(f, k)`: an erased-callable procedure whose capture is the site's live
+values and whose one explicit argument is the task. When the site's callee is
+a procedure, it reads the call's result from the task's result buffer. It
+calls `C(f, k)` with its captures and that result, a tail site, and returns
+the continuation's result through the erased-callable result pointer.
+
+**Pending edges.** After each suspension site that is not a tail site, the
+procedure tests whether the call paused, with the paused side cold:
+
+- after a call to a procedure that may suspend, a `switch_initialized_payload`
+  on the call's target, whose condition reads the task's pending flag. The
+  call's suspension mark is the explicit data that makes its target present
+  only under that condition, so ARC and the certifier both walk both sides,
+  and neither reads the target on the paused side;
+- after a hosted call, a switch on the returned `RocPoll`, whose paused side
+  sets the task's pending flag.
+
+The paused side, the *pending edge*, saves a record and returns:
+
+```text
+r = call g(x, task)
+switch_initialized_payload ready(task) payload=r
+  initialized: ...the code that followed the call...
+  uninitialized (cold):
+    suspend_save task R(f, k) [live values]
+    suspend_return
+```
+
+`suspend_save` is a statement. Like `assign_packed_erased_fn`, it names a
+procedure, `R(f, k)`, and a capture layout whose RC helper is the record's
+drop; it packs that erased callable over the live values and pushes it onto
+the task's record chain. Every pass that follows procedure references
+(reachability, LirImage, emission units, `debug_print`) treats its procedure
+as it treats a packed erased function's.
+
+Every value operand of `suspend_save` is *saved*: stored by the statement,
+but never a reason for its binding to be owned. Mode solving treats a saved
+operand as a borrowed occurrence whose lender is live at the statement;
+emission supplies the stored reference by moving a unit the frame owns that
+dies there, and otherwise by a retain. ARC gives saved operands a transfer
+path of their own, since a site may save any number of values and the
+statement has no target. Dismantle analysis treats a saved operand as a use
+of the whole value, so no field is taken across a site. In builds that solve
+thread confinement, a saved value is a host-visibility seed, because the
+record is an erased callable. A record therefore owns everything it holds,
+and a borrowed parameter stays borrowed: the path on which nothing pauses
+keeps the ownership solution it would have without the edge.
+
+`suspend_return` is a terminal statement that returns without a result. ARC
+releases what the frame owns before it, as before any return. Every consumer
+emits a return that writes nothing; the interpreter, as it does for a
+handed-up pending call, records that the activation returned no value, and
+a tail site's return of a value-less target is checked against that state.
+
+In a procedure that may suspend, ARC defers no erased call, so no such
+procedure uses a pending cell.
+
+### Records And The Task
+
+A record is an erased callable: `R(f, k)` with the saved values as its
+capture. Dropping a record is releasing the callable, whose capture drop
+releases every saved value exactly once. A paused task is its list of
+records, innermost first. The records one unwind saves arrive innermost
+first, and the runtime puts them, in that order, before the records that
+were still waiting.
+
+Each task has two buffers, whose sizes and alignments are program constants
+the continuation pass records for the runtime:
+
+- The *hosted slot*, for the largest result of a `suspending` hosted
+  procedure, passed to each suspending hosted call as `out`. On the ready
+  path the caller reads the result at once. On the pending path the host
+  writes it later, and the hosted site's continuation reads it. A task waits
+  on at most one hosted operation at a time, so one slot is enough. No Roc
+  code writes it.
+- The *result buffer*, for the largest result of a procedure that may
+  suspend. The runtime calls each resume entry with it as the result pointer,
+  except the outermost record of a root, whose result goes to the root's
+  result storage. A resume entry reads its call's result from the buffer
+  before its continuation runs. What it writes there is its result only when
+  the task is not pending afterwards.
+
+Resuming a task clears its pending flag and repeats, until the list is empty
+or the task pauses again: take the innermost record and call it with the
+task, then release it. A root in a `Tasks` build is a task from the start:
+its `provides` entry creates the task with a start record, an erased callable
+whose capture is the entry's arguments and whose procedure calls the root's
+body with the task. The host's first resume runs it.
+
+Cancelling a parked task asks the host to abandon the operation it is parked
+on (`roc_task_abort`) and releases its records. If the host had already
+written the hosted slot, the runtime releases that result too, with the
+release the innermost record names for it, so a cancelled task leaks nothing
+its Roc code owned.
+
+### Host Contract
+
+Shown in C. A suspending hosted function takes the task and the result
+pointer before its other arguments, and returns whether it finished:
+
+```c
+typedef enum { ROC_READY, ROC_PENDING } RocPoll;
+RocPoll roc_http_get_utf8(RocTask *task, HttpResult *out, RocStr url);
+```
+
+It owns its arguments either way, as every hosted function does. After
+returning `ROC_PENDING`, the host writes `*out` exactly once and then calls
+`roc_task_wake(task)`. A `provides` entry of a `Tasks` platform returns its
+task instead of its result, and writes the result to `result_out`, whose
+contents are defined only once the task reports `DONE`:
+
+```c
+RocTask *roc_main(RocList args, MainResult *result_out);
+RocTaskStatus roc_task_resume(RocTask *task); /* PENDING, DONE, CANCELLED */
+void roc_task_wake(RocTask *task);            /* its pending result is ready */
+void roc_task_cancel(RocTask *task);          /* release a parked task */
+void roc_task_free(RocTask *task);            /* after DONE or CANCELLED */
+void roc_task_ready(RocTask *task);           /* host: resume it once */
+void roc_task_abort(RocTask *task);           /* host: abandon its operation */
+```
+
+The host resumes a root once after creating it and once for each
+`roc_task_ready`, never from inside a hosted call or another resume. These
+symbols join the fixed runtime set and the glue templates of opting-in
+platforms. Waking, the wake protocol between threads, child tasks and crash
+exits are part of the task runtime, which extends this contract.
+
+### What Implements It First
+
+The first implementation supports `concurrency: Tasks` under `.lss` on the
+interpreter. Until the rest exists:
+
+- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
+  with any backend other than the interpreter, as an unsupported option
+  combination;
+- checking reports `concurrency: ParallelTasks` as not yet implemented;
+- the continuation pass stops with a not-yet-implemented panic, in every
+  build mode, when an erased-callable procedure other than a resume entry or
+  start record may suspend: its erased callers have no task to pass it. An
+  effectful function is erased at many explicit boundaries (Erased Callable
+  Requirements), so only this pass sees exactly when one may suspend. The
+  dev backend's not-yet-implemented panics are the precedent. Erased calls
+  become suspension sites, and the panic goes, when `.boxy` is supported.
+
+### Persisted Data
+
+- Checked modules gain the `suspending` mark on hosted declarations and the
+  platform's `concurrency` mode, so the checked-module cache version moves.
+- LIR gains the `suspends` marks, `suspend_save` and `suspend_return`, and
+  LirImage carries them, so the LirImage format version moves.
+- The program records the two buffer sizes for the runtime.
+- Each change comes with the test that an entry of the previous version is
+  rejected.
+
+### Invariants
+
+Each is checked by a Debug compiler at the stage that establishes it, and
+compiled away in release builds.
+
+- **Suspension only where declared.** A `never` procedure contains no
+  suspension site. Every suspension site's callee is a `suspending` hosted
+  procedure or a `may` procedure, and every `may` procedure contains one.
+  Every tail site is a call whose next statement returns its target.
+- **No frame addresses across a pause.** No procedure that may suspend takes
+  a destination argument, holds a `ptr_alloca` slot live across a suspension
+  site, builds a frame callable, or uses a pending cell. No value is
+  maybe-uninitialized where it is live across a site.
+- **Record completeness.** Every `suspend_save` saves exactly the arguments of
+  its site's continuation, apart from the call's result, and every
+  continuation's arguments are exactly the values live after its site.
+- **Ownership.** ARC output passes the debug borrow certifier, which walks
+  both sides of every pending test and checks each saved operand as a stored
+  operand. No saved operand decides a binding's mode, and every procedure
+  that may suspend returns an owned result.
+- **Constant-space tail calls.** A tail site has no pending test, no
+  continuation and no record, and every call between continuations is a tail
+  site.
+- **Resume fidelity.** Every resume entry calls the continuation of its own
+  site with its captures in the continuation's argument order.
+
+`ROC_LIR_DUMP` prints each procedure's `suspends` mark and each suspension
+site, so the pass's output can be read like any other LIR.
+
+Tests establish the rest. The same program runs against a host that finishes
+every suspending call at once and a host that pauses at every one, and must
+give the same result, the same hosted-call trace and no live allocations
+afterwards; cancelling at each site in turn must also leave no live
+allocations. A program built for a platform that marks its hosted functions
+`suspending` must give the LIR it gets without the marks, apart from the
+task arguments, the hosted calls' new shape, the pending tests and edges,
+and the continuations and resume entries. A Python model of the design
+(`design/language/concurrency-prototype` on the proposal branch) runs the
+same programs as an executable specification.
+
 ## Debug Invariants
 
 Every stage boundary has debug-only verification. In release builds, invariant
@@ -33504,6 +33836,10 @@ Minimum boundary checks:
 - ARC insertion sees a dynamic local only through its explicit descriptor
   local.
 - ARC output passes the debug borrow certifier.
+- Suspendability marks are complete before the procedure-local rewrites, and
+  no procedure that may suspend has a destination variant.
+- The continuation pass's output satisfies the invariants of Suspendable
+  Effects before ARC runs.
 - Backends receive only ARC-complete LIR.
 - No deduplication, specialization, or callable-merging step maps two
   `hosted` declarations or two `provides` exports to one identity, even when
