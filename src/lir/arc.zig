@@ -1674,6 +1674,9 @@ const VariantTable = struct {
             .emission_unit = source_spec.emission_unit,
             .is_static_initializer = source_spec.is_static_initializer,
             .hosted = source_spec.hosted,
+            // The variant's body is the source's, so it suspends where the
+            // source does.
+            .suspends = source_spec.suspends,
             .tail_transform = source_spec.tail_transform,
             .tail_group = source_spec.tail_group,
             // The variant's body is the source's, so it has the source's shapes.
@@ -1723,6 +1726,7 @@ const VariantTable = struct {
             .external = true,
             .linked = true,
             .may_leave_pending = source_spec.may_leave_pending,
+            .suspends = source_spec.suspends,
             .rc_read_only_params = source_spec.rc_read_only_params,
             .rc_ret_unique = source_spec.rc_ret_unique,
             .rc_ret_unique_fields = source_spec.rc_ret_unique_fields,

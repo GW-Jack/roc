@@ -14,6 +14,7 @@ const core = @import("lir_core");
 const Arc = @import("arc.zig");
 const ImmortalLocals = @import("immortal_locals.zig");
 const TailDrive = @import("tail_drive.zig");
+const SuspensionMarks = @import("suspension_marks.zig");
 const FrameCallables = @import("frame_callables.zig");
 const ProcPasses = @import("proc_passes.zig");
 const RangeProve = @import("range_prove.zig");
@@ -879,6 +880,8 @@ pub const stmt_kind_count = @typeInfo(std.meta.Tag(LIR.CFStmt)).@"enum".field_na
 /// A whole-program step of the LIR passes, or of the work after ARC, that
 /// detailed timing itemizes.
 pub const PassStep = enum {
+    /// Marking which procedures may suspend, before any rewrite.
+    suspension_marks,
     /// Resolving `.boxy` erased calls' ownership sources.
     erased_owner,
     return_slot,
@@ -2259,6 +2262,11 @@ fn finishLoweredOutput(
     verifyArithmeticBoundary(&lowered.lir_result.store);
     var lir_passes_timing_scope = PipelineStageScope.begin(target.timing, .lir_passes);
     defer lir_passes_timing_scope.end();
+    // The procedure-local rewrites read which procedures may suspend
+    // (design.md "Suspendability"), so the marks are committed first.
+    var suspension_marks_scope = PassStepScope.begin(target.timing, .suspension_marks);
+    try SuspensionMarks.run(allocator, &lowered.lir_result.store);
+    suspension_marks_scope.end();
     var local_pass_metrics: LirPassParallelMetrics = .{};
     var pass_target = target;
     pass_target.lir_pass_parallel_metrics_out = target.lir_pass_parallel_metrics_out orelse

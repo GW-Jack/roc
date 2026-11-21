@@ -33501,7 +33501,8 @@ interpreter and LirImage follow the output without knowing about suspension.
   ```
 
   It is part of the declaring module's checked output, so every importer
-  sees it, and it reaches LIR on the hosted procedure (`hosted.Proc`). Only
+  sees it, and it reaches LIR as the body-less hosted procedure's own
+  `suspends = may` mark (below), set when LIR construction makes it. Only
   effectful (`=>`) hosted declarations may carry it. A `suspending`
   declaration in a program whose platform is not `concurrency: Tasks` is a
   checking error. Both words are recognized only where they have this
@@ -33552,6 +33553,16 @@ calls; under `.lss` every call through a lambda set is a direct call, so the
 answer is exact. Each procedure records `LirProcSpec.suspends: never | may`,
 and each suspension site records it on its `CallExtra`. Later stages read
 these marks and never rediscover them.
+
+The fixpoint's seeds are the body-less procedures marked `may`: a
+`suspending` hosted procedure, marked when LIR construction makes it, and a
+procedure the native cache supplies, whose producer committed its mark. It
+propagates from each seed to the callers that call it directly and commits
+both marks on every procedure with a body, so a recomputation after rewrites
+replaces stale marks rather than adding to them. Erased calls are never
+sites here; the continuation pass rejects an erased-callable procedure that
+may suspend (What Implements It First). A clone of a call, such as a
+destination variant's, keeps the call's mark.
 
 The marks are computed right after LIR construction, so the procedure-local
 rewrites can see them, and computed again from the rewritten LIR by the

@@ -41,6 +41,7 @@ pub fn writeProc(
         try writer.print(" transform={s}", .{@tagName(proc.tail_transform)});
     }
     if (proc.tail_group.get()) |group| try writer.print(" tail_group={d}", .{@backingInt(group)});
+    if (proc.suspends == .may) try writer.writeAll(" suspends=may");
     try writer.writeAll("\n");
 
     if (proc.body.get()) |body| {
@@ -132,6 +133,7 @@ const Printer = struct {
                     if (extra.is_cold) try writer.writeAll(" cold");
                     if (extra.replaces_frame) try writer.writeAll(" replaces_frame");
                     if (extra.drive != .none) try writer.print(" drive={s}", .{@tagName(extra.drive)});
+                    if (extra.suspension_site) try writer.writeAll(" suspension_site");
                     try writer.writeByte('\n');
                     current = s.next;
                 },

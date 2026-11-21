@@ -2054,6 +2054,7 @@ pub fn CallResultFusion(comptime Spec: type) type {
                 .args = try self.store.addLocalSpan(args.items),
                 .extra = try self.store.addOptionalStmtRow(LIR.CallExtra, .{
                     .is_cold = self.store.stmtRowOrDefault(call.extra).is_cold,
+                    .suspension_site = self.store.stmtRowOrDefault(call.extra).suspension_site,
                 }),
                 .next = consumer.next,
             } }, origin);
@@ -2930,11 +2931,14 @@ pub fn BodyCloner(comptime Rewriter: type) type {
             return if (maybe) |local| try self.mapLocal(local) else null;
         }
 
-        /// The extra fields a call's clone carries: its cold-path flag.
+        /// The extra fields a call's clone carries: its cold-path flag and
+        /// its suspension-site mark. ARC's and tail drive's fields are made
+        /// again for the clone.
         pub fn mapCallExtra(self: *Self, id: LIR.StmtRowId(LIR.CallExtra)) Allocator.Error!LIR.StmtRowId(LIR.CallExtra) {
             const extra = self.store.stmtRowOrDefault(id);
             return self.store.addOptionalStmtRow(LIR.CallExtra, .{
                 .is_cold = extra.is_cold,
+                .suspension_site = extra.suspension_site,
             });
         }
 

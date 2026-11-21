@@ -19229,6 +19229,7 @@ fn recordLoweringDetail(reporter: *progress.Reporter, snapshot: lir.CheckedPipel
 
 fn passStepLabel(step: lir.CheckedPipeline.PassStep) []const u8 {
     return switch (step) {
+        .suspension_marks => "Suspension Marks",
         .erased_owner => "Erased Owner",
         .return_slot => "Return Slot",
         .str_append => "Str Append",
@@ -19306,7 +19307,7 @@ fn recordLirPassDetail(reporter: *progress.Reporter, snapshot: lir.CheckedPipeli
                 after_len += 1;
                 after_total +|= ns;
             },
-            .erased_owner, .return_slot, .str_append, .tag_reachability, .reachable_procs_before_arc => {
+            .suspension_marks, .erased_owner, .return_slot, .str_append, .tag_reachability, .reachable_procs_before_arc => {
                 before[before_len] = .{ .name = passStepLabel(step), .ns = ns };
                 before_len += 1;
             },
