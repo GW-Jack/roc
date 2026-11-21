@@ -636,6 +636,10 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .ptr_store,
         .ptr_load,
         .ptr_cast,
+        .task_ready,
+        .task_set_pending,
+        .task_hosted_slot,
+        .task_result_buffer,
         .crash,
         => .{},
     };

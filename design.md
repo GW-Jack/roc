@@ -33759,6 +33759,22 @@ the continuation pass records for the runtime:
   before its continuation runs. What it writes there is its result only when
   the task is not pending afterwards.
 
+LIR reaches the task only through four low-level operations on the task
+pointer. Only the continuation pass makes them, and none touches a reference
+count:
+
+- `task_ready(task)` is a `Bool`, true while the task's pending flag is
+  clear;
+- `task_set_pending(task)` sets the flag;
+- `task_hosted_slot(task)` and `task_result_buffer(task)` are the addresses
+  of the two buffers, typed by their target's `Ptr` layout and read with
+  `ptr_load`.
+
+The runtime's `RocTask` (`src/builtins/task.zig`) fixes where these live.
+The interpreter implements the operations against it. The other backends
+stop with a not-yet-implemented panic until they support `Tasks`, which the
+CLI already rejects for them.
+
 Resuming a task clears its pending flag and repeats, until the list is empty
 or the task pauses again: take the innermost record and call it with the
 task, then release it. A root in a `Tasks` build is a task from the start:

@@ -24,6 +24,7 @@ const rc_conformance = @import("rc_conformance.zig");
 const backend = @import("backend");
 const host_trampoline = @import("host_trampoline.zig");
 const builtins = @import("builtins");
+const RocTask = builtins.task.RocTask;
 const boxy = @import("boxy_runtime");
 const numeric_conversion = base.numeric_conversion;
 const sljmp = @import("sljmp");
@@ -6525,6 +6526,19 @@ pub const Interpreter = struct {
             .ptr_load => try self.evalPtrLoad(args[0], ll.ret_layout),
             .ptr_cast => try self.evalPtrCast(args[0], ll.ret_layout),
 
+            // ── Task ──
+            .task_ready => blk: {
+                const val = try self.alloc(.bool);
+                val.write(u8, @intFromBool(taskOf(self.readPointerInt(args[0])).ready()));
+                break :blk val;
+            },
+            .task_set_pending => blk: {
+                taskOf(self.readPointerInt(args[0])).setPending();
+                break :blk Value.zst;
+            },
+            .task_hosted_slot => try self.pointerValue(ll.ret_layout, @intFromPtr(taskOf(self.readPointerInt(args[0])).hosted_slot)),
+            .task_result_buffer => try self.pointerValue(ll.ret_layout, @intFromPtr(taskOf(self.readPointerInt(args[0])).result_buffer)),
+
             // ── Crash ──
             .crash => return self.triggerCrash("Roc crashed"),
 
@@ -8145,6 +8159,18 @@ pub const Interpreter = struct {
             }
             result.copyFrom(.{ .ptr = @ptrFromInt(raw_ptr) }, size);
         }
+        return result;
+    }
+
+    /// The task a `task_*` operation's pointer operand addresses.
+    fn taskOf(raw: usize) *RocTask {
+        return @ptrFromInt(raw);
+    }
+
+    /// A value of pointer layout `ret_layout` holding `raw`.
+    fn pointerValue(self: *LirInterpreter, ret_layout: layout_mod.Idx, raw: usize) Error!Value {
+        const result = try self.alloc(ret_layout);
+        self.layoutRuntime().writePointerInt(result, raw);
         return result;
     }
 

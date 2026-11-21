@@ -11,5 +11,6 @@ test {
     _ = @import("eval/test/lir_inline_test.zig");
     _ = @import("eval/test/rc_conformance_tests.zig");
     _ = @import("eval/test/trmc_lir_test.zig");
+    _ = @import("eval/test/task_ops_lir_test.zig");
     _ = @import("cli/main.zig");
 }

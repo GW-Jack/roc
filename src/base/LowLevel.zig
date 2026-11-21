@@ -673,6 +673,19 @@ pub const LowLevel = enum(u16) {
     // Crash/panic
     crash,
 
+    // Task operations (design.md "Records And The Task"), made only by the
+    // continuation pass. The task is an `opaque_ptr` with no reference count.
+    // They come last so that no operation checked modules or LIR images
+    // store changes number.
+    /// (task) -> Bool: whether the task's pending flag is clear.
+    task_ready,
+    /// (task) -> {}: set the task's pending flag.
+    task_set_pending,
+    /// (task) -> Ptr(T): the address of the task's hosted slot.
+    task_hosted_slot,
+    /// (task) -> Ptr(T): the address of the task's result buffer.
+    task_result_buffer,
+
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
     /// evaluator share the semantic oracle's operation vocabulary without a
@@ -1263,6 +1276,11 @@ pub const LowLevel = enum(u16) {
         .ptr_alloca = byType(.none()),
         .ptr_load = byType(.none()),
         .ptr_cast = byType(.none()),
+
+        .task_ready = byType(.none()),
+        .task_set_pending = byType(.none()),
+        .task_hosted_slot = byType(.none()),
+        .task_result_buffer = byType(.none()),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

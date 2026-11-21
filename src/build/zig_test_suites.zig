@@ -33,6 +33,7 @@ pub const suites = [_]Suite{
     .{ .suffix = "checked-root-graph", .coverage = .minici },
     .{ .suffix = "lir-inline", .coverage = .minici },
     .{ .suffix = "trmc-lir", .coverage = .minici },
+    .{ .suffix = "task-ops-lir", .coverage = .minici },
     .{ .suffix = "build-helpers", .coverage = .minici },
     .{ .suffix = "backend-llvm", .coverage = .minici },
     .{ .suffix = "rc-conformance", .coverage = .minici },
