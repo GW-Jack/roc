@@ -1,0 +1,584 @@
+"""Hosts: hosted functions, schedulers, and the harness that runs a program.
+
+Hosted functions are deterministic in their arguments, so two runs that make
+the same calls get the same results whatever the schedule.
+
+Policies (how the host schedules):
+    ready        every suspending call completes at once (ROC_READY)
+    pause        every suspending call returns ROC_PENDING; FIFO resumes
+    input_order  always act on the task earliest in input order (C9, G3)
+    random       random mixes of the above, completions before the hosted
+                 function returns, root cancellation, and (ParallelTasks)
+                 other threads' resumes run from inside any hosted call, so
+                 a child's report can reach a parent that is running
+"""
+
+from __future__ import annotations
+
+import random
+from collections import Counter
+from dataclasses import dataclass, field
+
+from engines import NoneEngine, ProgramCrash, StackEngine, UnwindEngine
+from heap import Heap
+from runtime import CANCELLED, CRASHED, DONE, PENDING, WAITS, NoneCrash, Runtime, Violation
+from sessions import HOST
+
+
+def _read(heap, i):
+    if i % 4 != 0:
+        return heap.alloc("tag", "Ok", [i * 3 + 1])
+    return heap.alloc("tag", "Err", [heap.alloc("str", f"e{i}", [])])
+
+
+HOSTED = {
+    # name: (suspending, result from argument data)
+    "read": (True, _read),
+    "slow": (True, lambda heap, i: i + 7),
+    "fetch": (True, lambda heap, i: heap.alloc("str", f"s{i}", [])),
+    "send": (True, lambda heap, s: len(s[1])),  # takes a heap argument
+    "log": (False, lambda heap, s: len(s[1])),
+    "tick": (False, lambda heap, i: i + 1),
+    # A remote operation that takes a permit (an Out end) with its work: the
+    # host releases the permit only when the operation has finished.
+    "remote": (True, lambda heap, permit, i: i + 100),
+    "work": (True, lambda heap, i: i + 100),  # the same operation, without the permit
+    # The number of earlier calls with the same argument (tests only: lets a
+    # supervised task behave differently when it is restarted).
+    "nth": (False, None),
+}
+SUSPENDING = {k: v[0] for k, v in HOSTED.items()}
+
+
+@dataclass
+class Op:
+    task: object
+    name: str
+    args: list
+    aborted: bool = False
+
+
+class Policy:
+    parallel = False
+
+    def on_call(self, host, t, name):
+        return "pending"
+
+    def during_call(self, host):
+        pass
+
+    def choose(self, host):
+        live = [i for i, op in enumerate(host.ops) if not op.aborted]
+        if host.queue:
+            return ("resume", 0)
+        if live:
+            return ("complete", live[0])
+        if host.ops:
+            return ("complete", 0)
+        return None
+
+
+class ReadyPolicy(Policy):
+    name = "ready"
+
+    def on_call(self, host, t, name):
+        return "ready"
+
+
+class PausePolicy(Policy):
+    name = "pause"
+
+
+class InputOrderPolicy(Policy):
+    """The sequential schedule, which a None build must match (C9, G3). A None
+    build has one stack, so this schedule acts on the task earliest in input
+    order, and
+
+    - while a task waits at a port (a receive, a take or an acquire), lets
+      only the tasks that started since
+      run (in a None build, everything else is below the receive on the
+      stack). The receiver that parked last is the top of the stack; it is
+      "active" when every task that started since it parked has finished (a
+      None build runs each demanded entry to its end);
+    - starts a concurrent loop's entry only when its owner waits at that
+      loop's head, or the top receiver is active (a None build runs entries
+      that have not started on demand until the message arrives);
+    - resumes the top receiver only when it is active;
+    - resumes a task at a loop head only when none of that loop's entries has
+      begun and not finished (in a None build, the head runs one entry to its
+      end before it returns; an entry run on demand meanwhile may finish
+      first, and arrives first, but the head waits for the one it runs).
+
+    A host may delay any ready task, so this is one legal schedule."""
+
+    name = "input_order"
+
+    def allowed(self, host, t):
+        top = host.top
+        if top is None or host.rt.linked_crash(t) is not None:
+            return True  # a crash unwinds the one stack at once
+        if t is top:
+            return host.active
+        return t.start_seq is None or t.start_seq >= top.wait_mark
+
+    def eligible(self, host, t):
+        if not self.allowed(host, t):
+            return False
+        if t.waiting == "group" and host.rt.linked_crash(t) is None and any(
+                e.task is not None and e.task.start_seq is not None and e.task.phase != "finished"
+                for e in t.wait_group.entries):
+            return False
+        if t.entry is None or t.phase != "new" or t.cancel_req:
+            return True
+        owner = t.parent
+        return host.active or (owner.waiting == "group" and owner.wait_group is t.entry[0])
+
+    def choose(self, host):
+        waiters = [u for u in host.rt.tasks.values() if u.waiting in WAITS]
+        # A crash unwinds the one stack at once: finish propagating it first.
+        crashing = [(t.path, i) for i, t in enumerate(host.queue) if host.rt.linked_crash(t) is not None]
+        if crashing:
+            return ("resume", min(crashing)[1])
+        top = host.top = max(waiters, key=lambda u: (u.wait_mark, u.id)) if waiters else None
+        host.active = top is not None and all(u.phase == "finished" for u in host.rt.tasks.values()
+                                              if u.start_seq is not None and u.start_seq >= top.wait_mark)
+        cands = [(t.path, 0, ("resume", i)) for i, t in enumerate(host.queue) if self.eligible(host, t)]
+        cands += [(op.task.path, 1, ("complete", i)) for i, op in enumerate(host.ops)
+                  if not op.aborted and self.allowed(host, op.task)]
+        if cands:
+            return min(cands, key=lambda c: (c[0], c[1]))[2]
+        if host.ops:
+            return ("complete", 0)
+        return None
+
+
+class CoroutinePolicy(Policy):
+    """Option (a) of concurrency-sessions.md, "Decisions left to prototypes":
+    a None build whose tasks are coroutines on its one stack. Hosted calls
+    finish in place, as in any None build. A task that would wait at a port
+    or a loop head pauses by unwinding into records, back to the build's own
+    scheduler, which resumes the ready task earliest in input order. So a
+    receiver that would block switches to the writer it waits for, once
+    nothing earlier in input order can run.
+
+    The build runs the unwinding lowering, so this is a policy for the Tasks
+    runtime with one thread and no host operations in flight."""
+
+    name = "coroutine"
+
+    # Whether an entry that has not begun waits for its owner to ask: it is
+    # resumed only while its owner waits at that entry's loop head, unless
+    # no other task can run. Without this, an outer loop's entries, started
+    # when the loop began, run before the entries of a loop nested in its
+    # body, which come later in the task tree, and a program that cannot
+    # wait no longer gives the plain stack's results.
+    lazy_entries = True
+
+    def __init__(self, lazy_entries=None):
+        if lazy_entries is not None:
+            self.lazy_entries = lazy_entries
+
+    def on_call(self, host, t, name):
+        return "ready"
+
+    def asked(self, t):
+        if t.entry is None or t.phase != "new" or t.cancel_req:
+            return True
+        owner = t.parent
+        return owner.waiting == "group" and owner.wait_group is t.entry[0]
+
+    def choose(self, host):
+        if not host.queue:
+            return None
+        # A crash unwinds the one stack at once: finish propagating it first.
+        crashing = [(t.path, i) for i, t in enumerate(host.queue) if host.rt.linked_crash(t) is not None]
+        if crashing:
+            return ("resume", min(crashing)[1])
+        cands = [(t.path, i) for i, t in enumerate(host.queue) if not self.lazy_entries or self.asked(t)]
+        return ("resume", min(cands or [(t.path, i) for i, t in enumerate(host.queue)])[1])
+
+
+class RandomPolicy(Policy):
+    name = "random"
+
+    def __init__(self, seed, parallel=False, p_cancel=0.0):
+        self.rng = random.Random(seed)
+        self.parallel = parallel
+        self.p_cancel = p_cancel
+        self.depth = 0
+
+    def on_call(self, host, t, name):
+        return self.rng.choices(["ready", "pending", "early"], [3, 5, 2])[0]
+
+    def during_call(self, host):
+        if not self.parallel or self.depth >= 3:
+            return
+        self.depth += 1
+        for _ in range(self.rng.choice([0, 0, 1, 2, 3])):
+            if not host.step():
+                break
+        self.depth -= 1
+
+    def choose(self, host):
+        rng = self.rng
+        if host.root_status == PENDING and not host.root_cancelled and rng.random() < self.p_cancel:
+            return ("cancel_root",)
+        acts = [("resume", i) for i in range(len(host.queue))] + [("complete", i) for i in range(len(host.ops))]
+        return rng.choice(acts) if acts else None
+
+
+class Host:
+    # P5 lets a host keep an aborted operation's arguments until the
+    # operation finishes. A port among them (a permit passed to the call) is
+    # then released only when the platform is done with the operation.
+    keep_aborted_args = False
+
+    def __init__(self, rt, heap, policy):
+        self.top = None  # InputOrderPolicy: the receiver at the top of the one stack
+        self.active = False  # InputOrderPolicy: whether it runs entries on demand now
+        self.rt, self.heap, self.policy = rt, heap, policy
+        self.queue = []
+        self.ops = []
+        self.effects = []
+        self.stats = Counter()
+        self.root = None
+        self.root_status = PENDING
+        self.root_cancelled = False
+        self.result = None
+        self.calls = Counter()  # for "nth"
+        self.inflight = Counter()  # suspending operations started and not finished, aborted ones included
+        rt.host = self
+
+    # -- what the runtime calls --
+    def thread_for(self, t, depth):
+        """The thread a resume runs on: nested resumes are other threads."""
+        return depth
+
+    def suspending(self, name):
+        return SUSPENDING[name]
+
+    def call(self, t, name, args):
+        heap = self.heap
+        data = [heap.data(a) for a in args]
+        self.effects.append((t.path, name, tuple(data)))
+        susp, fn = HOSTED[name]
+        d = self.policy.on_call(self, t, name) if susp else "ready"
+        if susp:
+            self.inflight[name] += 1
+            self.stats["most " + name + " at once"] = max(self.stats["most " + name + " at once"], self.inflight[name])
+        if d == "ready":
+            self.policy.during_call(self)
+            if susp:
+                self.inflight[name] -= 1
+            if name == "nth":
+                v = self.calls[tuple(data)]
+                self.calls[tuple(data)] += 1
+            else:
+                v = fn(heap, *data)
+            for a in args:
+                heap.drop(a)
+            return ("ready", v)
+        op = Op(t, name, args)
+        self.ops.append(op)
+        self.stats["pending"] += 1
+        if d == "early":
+            self.stats["early"] += 1
+            self.complete(op)
+        self.policy.during_call(self)
+        return ("pending",)
+
+    def ready(self, t):
+        self.queue.append(t)
+
+    def abort(self, t):
+        for op in self.ops:
+            if op.task is t and not op.aborted:
+                op.aborted = True
+                self.stats["aborted"] += 1
+                if self.keep_aborted_args:
+                    return  # released when the operation finishes
+                for a in op.args:  # P5: arguments released exactly once
+                    self.heap.drop(a)
+                op.args = None
+                return
+        raise Violation(f"P4: abort of task {t.id} with no pending operation")
+
+    # -- host side --
+    def complete(self, op):
+        self.ops.remove(op)
+        self.inflight[op.name] -= 1
+        heap = self.heap
+        if op.aborted:
+            # The abandoned operation finished anyway: release its result,
+            # and its arguments if they were kept.
+            for a in op.args or ():
+                heap.drop(a)
+            op.args = None
+            return
+        fn = HOSTED[op.name][1]
+        outer, heap.task = heap.task, op.task.id  # the result belongs to the task it is for
+        v = fn(heap, *[heap.data(a) for a in op.args])
+        heap.task = outer
+        for a in op.args:
+            heap.drop(a)
+        self.rt.write_slot(op.task, v)
+        self.rt.task_wake(op.task)
+
+    def drained(self):
+        """Every operation, aborted ones included, has finished."""
+
+    def step(self):
+        act = self.policy.choose(self)
+        if act is None:
+            return False
+        if act[0] == "cancel_root":
+            self.root_cancelled = True
+            self.rt.cancel_root(self.root)
+            return True
+        if act[0] == "complete":
+            self.complete(self.ops[act[1]])
+            return True
+        t = self.queue.pop(act[1])
+        status = self.rt.resume(t)
+        if t is self.root and status != PENDING:
+            self.finish_root(status)
+        return True
+
+    def finish_root(self, status):
+        rt, root = self.rt, self.root
+        self.root_status = status
+        if status == DONE:
+            self.result = ("done", self.heap.data(root.outcome[1]))
+        elif status == CRASHED:
+            self.result = ("crashed", rt.crash_message(root))
+        else:
+            self.result = ("cancelled",)
+        rt.free_root(root)
+
+
+@dataclass
+class Run:
+    result: tuple
+    effects: list
+    heap: Counter
+    engine: Counter
+    runtime: Counter
+    host: Counter
+    leaked_live: int = 0
+    extra: dict = field(default_factory=dict)
+
+
+def run_tasks(lowering, engine_kind, policy, concurrency="Tasks", max_steps=200000, host_cls=None,
+              none_build=False):
+    """Run a lowered program as a root task under a host policy; check the
+    runtime invariants and the exact heap accounting afterwards. With
+    `none_build`, a crash stops the program at once, as in a None build:
+    the result is then the crash, and the heap is not checked, as in
+    `run_none`."""
+    prog = lowering.prog
+    heap = Heap()
+    rt = Runtime(heap, concurrency)
+    rt.none_build = none_build
+    host = (host_cls or Host)(rt, heap, policy)
+    if engine_kind == "unwind":
+        eng = UnwindEngine(prog, lowering, heap, rt)
+    else:
+        eng = StackEngine(prog, heap, rt)
+    rt.attach(eng, prog)
+    clo = heap.alloc("clo", prog.entry, [])
+    host.root = rt.start_root(clo)
+    host.queue.append(host.root)
+    steps = 0
+    try:
+        while host.root_status == PENDING:
+            if not host.step() and not rt.break_deadlock():
+                raise Violation("R6: no task can run and the root has not finished")
+            steps += 1
+            if steps > max_steps:
+                raise Violation("R6: the run did not terminate")
+    except NoneCrash as c:
+        return Run(("crashed", c.msg), host.effects, heap.stats, getattr(eng, "stats", Counter()), rt.stats,
+                   host.stats, extra={"supervised": c.supervised})
+    while host.ops:  # late completions of aborted operations
+        host.complete(host.ops[0])
+    host.drained()
+    rt.check_quiescent()
+    rt.sessions.leave(HOST, kinds=("shared",))  # the run is over: the host keeps no cell
+    live = heap.verify(rt.leaked + rt.sessions.held())
+    return Run(host.result, host.effects, heap.stats, getattr(eng, "stats", Counter()), rt.stats, host.stats,
+               leaked_live=live)
+
+
+class SyncHost:
+    """The host of a None build: every hosted call completes before it returns."""
+
+    def __init__(self, heap):
+        self.heap = heap
+        self.effects = []
+        self.calls = Counter()
+
+    def call_sync(self, path, name, args):
+        heap = self.heap
+        data = [heap.data(a) for a in args]
+        self.effects.append((path, name, tuple(data)))
+        if name == "nth":
+            v = self.calls[tuple(data)]
+            self.calls[tuple(data)] += 1
+        else:
+            v = HOSTED[name][1](heap, *data)
+        for a in args:
+            heap.drop(a)
+        return v
+
+
+# A None build's hosted calls finish in place, so they are never sites.
+NONE_HOSTED = {k: False for k in HOSTED}
+WAIT_OPS = ("recv", "take", "acquire", "step")
+
+
+def can_wait(prog):
+    """Whether a task of the program can wait for another: a receive, a take,
+    an acquire or an update (which may answer Wait) in a procedure reachable
+    from main. Only then does a None build need tasks (RFC, "On platforms
+    that do not schedule tasks")."""
+    from ir import blocks
+    seen, stack = set(), [prog.entry]
+    while stack:
+        f = stack.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        for b in blocks(prog.procs[f].body):
+            for st in b.stmts:
+                if st[0] != "let":
+                    continue
+                e = st[2]
+                if e[0] in WAIT_OPS:
+                    return True
+                if e[0] in ("call", "clo"):
+                    stack.append(e[1])
+                if e[0] in ("step", "defer", "errdefer"):
+                    stack.append(e[1])
+            if b.term[0] == "tail":
+                stack.append(b.term[1])
+    return False
+
+
+def run_none_build(arc, mode="lss", engine_kind="unwind"):
+    """A None build. A program that cannot wait runs on one plain stack
+    (`run_none`). One that can wait runs its tasks as coroutines on one
+    thread, with hosted calls that finish in place, resuming the ready task
+    first in the task tree (CoroutinePolicy)."""
+    if not can_wait(arc.prog):
+        r = run_none(arc.prog)
+        r.extra["engine"] = "stack"
+        return r
+    from lower import Lowering
+    low = Lowering(arc, NONE_HOSTED, mode)
+    r = run_tasks(low, engine_kind, CoroutinePolicy(), none_build=True)
+    r.extra["engine"] = "coroutine"
+    return r
+
+
+def run_none(prog):
+    heap = Heap()
+    host = SyncHost(heap)
+    eng = NoneEngine(prog, heap, host)
+    try:
+        v = eng.run()
+    except ProgramCrash as c:
+        return Run(("crashed", c.msg), host.effects, heap.stats, Counter(), Counter(), Counter(),
+                   extra={"supervised": c.supervised, "on demand": eng.stats["entries run on demand"]})
+    result = ("done", heap.data(v))
+    heap.drop(v)
+    eng.sessions.release_cells()
+    heap.verify([])
+    lost = eng.sessions.unreturned()
+    if lost:
+        raise Violation(f"S9: semaphore cells missing permits (id, free, permits): {lost}")
+    return Run(result, host.effects, heap.stats, Counter({"steps": eng.steps}), Counter(), Counter(),
+               extra={"on demand": eng.stats["entries run on demand"],
+                      "cells released": eng.stats["cells released"]})
+
+
+class ServiceHost(Host):
+    """A host that serves many roots (concurrency-sessions.md, "Services
+    across roots"): a long-lived service root, started with a mailbox's
+    Inbox, and request roots, each started with a copy of its Post. The host
+    keeps no Post itself, so the service's inbox closes once every request
+    root is done with it."""
+
+    def __init__(self, rt, heap, policy):
+        super().__init__(rt, heap, policy)
+        self.roots = []
+        self.results = {}
+
+    def step(self):
+        act = self.policy.choose(self)
+        if act is None:
+            return False
+        if act[0] == "complete":
+            self.complete(self.ops[act[1]])
+            return True
+        t = self.queue.pop(act[1])
+        status = self.rt.resume(t)
+        if t.parent is None and status != PENDING:
+            if status == DONE:
+                self.results[t.id] = ("done", self.heap.data(t.outcome[1]))
+            elif status == CRASHED:
+                self.results[t.id] = ("crashed", self.rt.crash_message(t))
+            else:
+                self.results[t.id] = ("cancelled",)
+            self.rt.free_root(t)
+        return True
+
+    def stalled_roots(self):
+        """Per-root deadlock detection: crash the last waiter of each stalled tree."""
+        found = False
+        for r in self.roots:
+            if self.rt.stalled(r, self.queue):
+                self.stats["roots stalled"] += 1
+                self.rt.break_deadlock(self.rt.tree(r))
+                found = True
+        return found
+
+
+def run_service(lowering, engine_kind, policy, service, requests, concurrency="Tasks", per_root=True,
+                max_steps=200000):
+    """Run a service root, `service(inbox)`, beside request roots, each
+    `name(post, *args)` for (name, args) in `requests`. Returns the results by
+    root, the service's first."""
+    prog = lowering.prog
+    heap = Heap()
+    rt = Runtime(heap, concurrency)
+    host = ServiceHost(rt, heap, policy)
+    rt.attach(UnwindEngine(prog, lowering, heap, rt) if engine_kind == "unwind" else StackEngine(prog, heap, rt), prog)
+    ses = rt.sessions
+    mb = ses.mailbox("host")
+    post, inbox = heap.obj(mb).fields
+    heap.dup(post)
+    heap.dup(inbox)
+    heap.drop(mb)
+    host.roots.append(rt.start_root(heap.alloc("clo", service, [inbox])))
+    for name, args in requests:
+        heap.dup(post)
+        host.roots.append(rt.start_root(heap.alloc("clo", name, [post] + list(args))))
+    heap.drop(post)
+    ses.leave("host")  # the host keeps nothing it started the roots with
+    host.root = host.roots[0]
+    host.queue = list(host.roots)
+    steps = 0
+    while len(host.results) < len(host.roots):
+        progressed = host.step()
+        if per_root:
+            progressed = host.stalled_roots() or progressed
+        if not progressed and not rt.break_deadlock():
+            raise Violation("R6: no task can run and some root has not finished")
+        steps += 1
+        if steps > max_steps:
+            raise Violation("R6: the run did not terminate")
+    while host.ops:
+        host.complete(host.ops[0])
+    rt.check_quiescent()
+    heap.verify(rt.leaked + ses.held())
+    return [host.results[r.id] for r in host.roots], rt.stats, host.stats
