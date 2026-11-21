@@ -93,10 +93,31 @@ const Fixture = struct {
     }
 };
 
+/// A task with the fields the operations read and nothing the runtime uses:
+/// these tests run no records.
+fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
+    return .{
+        .pending = 0,
+        .hosted_slot = hosted_slot,
+        .result_buffer = result_buffer,
+        .woken = false,
+        .status = .pending,
+        .root_result = undefined,
+        .entries = undefined,
+        .len = 0,
+        .capacity = 0,
+        .hosted_slot_size = 0,
+        .hosted_slot_alignment = 1,
+        .result_buffer_size = 0,
+        .result_buffer_alignment = 1,
+        .ops = undefined,
+    };
+}
+
 test "task_ready reads the pending flag and task_set_pending sets it" {
     var slot: [8]u8 = undefined;
     var buffer: [8]u8 = undefined;
-    var task = RocTask{ .pending = 0, .hosted_slot = &slot, .result_buffer = &buffer };
+    var task = bareTask(&slot, &buffer);
     for ([_]bool{ false, true }) |set_first| {
         var f = try Fixture.init(std.testing.allocator);
         defer f.deinit();
@@ -119,7 +140,7 @@ test "task_hosted_slot and task_result_buffer address the task's buffers" {
     defer f.deinit();
     var slot: u64 = 77;
     var buffer: u64 = 0;
-    var task = RocTask{ .pending = 0, .hosted_slot = @ptrCast(&slot), .result_buffer = @ptrCast(&buffer) };
+    var task = bareTask(@ptrCast(&slot), @ptrCast(&buffer));
     const ptr_u64 = try f.layouts.insertPtr(.u64);
 
     // buffer.* = slot.* + 1; ret slot.*

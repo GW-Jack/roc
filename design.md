@@ -33777,8 +33777,29 @@ CLI already rejects for them.
 
 Resuming a task clears its pending flag and repeats, until the list is empty
 or the task pauses again: take the innermost record and call it with the
-task, then release it. A root in a `Tasks` build is a task from the start:
-its `provides` entry creates the task with a start record, an erased callable
+task, then release it.
+
+The list and this loop live with `RocTask`, and they are the same for every
+backend. Each entry is a record and, for a hosted site's record, the release
+of the hosted result, made from the `slot_drop` RC helper `suspend_save`
+names and absent for a procedure site and for a result with nothing to
+release. The release takes the slot, the record and the operations, so an
+interpreter's release finds its interpreter and the result's layout through
+the record, and compiled code passes an adapter over the RC helper, as it
+does for a capture's `on_drop`. A record is the data pointer of a boxed erased callable, holding the one
+reference the statement made. The runtime calls it through its function
+pointer, with an argument struct holding the task, its capture, and no
+reuse, so the capture stays borrowed for the call. An interpreter's record
+carries the interpreter's trampoline, so the interpreter runs it the same
+way. The result pointer is the result buffer, or the root's result storage
+when the list is empty once the record is taken. The records a call saves
+are pushed as they are made, innermost first; when the call returns, the
+runtime reverses them, so the innermost of them is taken next.
+
+Waking a task records that the host wrote the hosted slot, and clears with
+the next resume.
+
+A root in a `Tasks` build is a task from the start: its `provides` entry creates the task with a start record, an erased callable
 whose capture is the entry's arguments and whose procedure calls the root's
 body with the task. The host's first resume runs it.
 
@@ -33786,7 +33807,9 @@ Cancelling a parked task asks the host to abandon the operation it is parked
 on (`roc_task_abort`) and releases its records. If the host had already
 written the hosted slot, the runtime releases that result too, with the
 release the innermost record names for it, so a cancelled task leaks nothing
-its Roc code owned.
+its Roc code owned. A woken task's operation is finished, so cancelling it
+asks the host for nothing. Freeing a task frees its buffers and its list; a
+finished task's list is empty, and a cancelled one's was released.
 
 ### Host Contract
 
