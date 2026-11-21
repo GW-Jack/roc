@@ -263,6 +263,9 @@ pub const HostedFn = struct {
     template: names.ProcTemplate,
     external_symbol_name: names.ExternalSymbolNameId,
     dispatch_index: u32,
+    /// The checked declaration is `suspending` (design.md "Suspendable
+    /// Effects"); LIR construction marks its procedure `suspends = may`.
+    suspending: bool,
 };
 
 /// Nested function site inside an owner function template.
@@ -1088,7 +1091,8 @@ fn writeFnDef(hasher: *TypeDigestHasher, name_store: *const names.NameStore, fn_
 
 fn writeHostedFn(hasher: *TypeDigestHasher, name_store: *const names.NameStore, hosted: HostedFn) void {
     // The dispatch slot is assigned per program and is not part of the code
-    // the hosted function names.
+    // the hosted function names. `suspending` belongs to the declaration the
+    // template names, so the template already accounts for it.
     writeProcTemplate(hasher, hosted.template);
     writeBytes(hasher, name_store.externalSymbolNameText(hosted.external_symbol_name));
 }

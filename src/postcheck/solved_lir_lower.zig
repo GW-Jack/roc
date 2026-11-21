@@ -3126,6 +3126,24 @@ const Lowerer = struct {
         };
     }
 
+    /// A `suspending` hosted procedure's mark, the seed of design.md
+    /// "Suspendability". Every other procedure starts `never`; the marks pass
+    /// computes the ones with bodies.
+    fn suspendsForSource(source: ?Mono.FnTemplate) LIR.Suspends {
+        const template = source orelse return .never;
+        const suspending = switch (template.fn_def) {
+            .local_hosted, .imported_hosted => |hosted| hosted.suspending,
+            .local_template,
+            .imported_template,
+            .nested,
+            .checked_generated,
+            .parser_runtime,
+            .encoder_for_runtime,
+            => false,
+        };
+        return if (suspending) .may else .never;
+    }
+
     /// `fn_id`'s own function type at instance `env`.
     fn ownFnType(self: *const Lowerer, fn_id: Lifted.FnId, env: Env) Ref {
         const solved_fn_ty = self.resolveRef(.{ .ty = self.solved.fn_tys.items[@backingInt(fn_id)], .env = env });
@@ -3277,6 +3295,7 @@ const Lowerer = struct {
             .erased_capture_arg = if (spec.abi == .erased) .some(arg_locals[lifted_args.len]) else .none,
             .abi = if (spec.abi == .erased) .erased_callable else .roc,
             .hosted = .of(try self.hostedProcForSource(source_fn.source)),
+            .suspends = suspendsForSource(source_fn.source),
             .code_key = code_key,
             .stack_probe = self.stackProbeForProc(args_span, LIR.LocalSpan.empty(), ret_layout),
         }, proc_loc);

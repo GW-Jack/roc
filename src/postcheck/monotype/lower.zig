@@ -4649,6 +4649,7 @@ const HostedCatalogEntry = struct {
     order: []const u8,
     target_checked_module_digest: [32]u8,
     def_idx: u32,
+    suspending: bool,
 };
 
 const HostedProcedureKey = struct {
@@ -7243,6 +7244,7 @@ const Builder = struct {
                 .order = proc.orderKey(view.hosted_procs),
                 .target_checked_module_digest = view.key.bytes,
                 .def_idx = @backingInt(proc.def_idx),
+                .suspending = proc.suspending,
             });
         }
     }
@@ -7263,6 +7265,7 @@ const Builder = struct {
                 .mapped => |index| index,
                 .unavailable => Common.invariant("unavailable hosted declaration reached extern emission"),
             },
+            .suspending = entry.suspending,
         };
     }
 
