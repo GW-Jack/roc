@@ -33897,6 +33897,95 @@ symbols join the fixed runtime set and the glue templates of opting-in
 platforms. Waking, the wake protocol between threads, child tasks and crash
 exits are part of the task runtime, which extends this contract.
 
+### Backends
+
+Every backend runs the same LIR against the same `RocTask`, so a task
+built by compiled code and one built by the interpreter look the same to
+the runtime and to the host. What compiled code must agree on, byte for
+byte:
+
+- **The task's fields.** LIR holds the task as an `opaque_ptr` with no
+  reference count. `RocTask` keeps the three fields compiled code reaches
+  first and in this order: `pending` (one byte) at offset 0, then
+  `hosted_slot` and `result_buffer`, each a pointer at the next
+  pointer-aligned offset. `task_ready` is a load of `pending` compared with
+  zero, `task_set_pending` stores one, and `task_hosted_slot` and
+  `task_result_buffer` load their pointers. `src/builtins/task.zig` names
+  the three offsets. Backends read those names, and a comptime check there
+  fails if a field moves. Compiled code reaches the other fields only
+  through the runtime.
+- **`task_create`.** Its operands are, in order: the start record, which
+  it takes; `root_result`, a plain pointer; then the hosted slot's size and
+  alignment and the result buffer's size and alignment, each a `U64`.
+  Compiled code calls the builtin `roc_builtins_task_create` with the same
+  six arguments in the same order, `callconv(.c)`, returning the task. The
+  task keeps the `RocOps` it is given, and allocates, calls its records and
+  releases them through those ops for its whole life. So the builtin hands
+  it ops that outlive the task, such as the process's host ops (the ops
+  every builtin wrapper reaches), never a per-call ops struct.
+- **Records.** A record, the start record included, is a boxed erased
+  callable: the allocation `assign_packed_erased_fn` makes, with its
+  `Payload` header (`callable_fn_ptr`, `on_drop`, `on_copy`,
+  `capture_size`) followed by the capture. It is always heap-allocated with
+  one reference. A backend never gives a record a frame slot or repacks a
+  reused allocation for it, even where it would for another packed
+  callable. Its function is the
+  resume entry `R(f, k)`, or the start procedure, compiled with the
+  erased-callable ABI:
+  `fn(ops, ret, args, capture, reuse, out_desc) callconv(.c)`.
+  - `args` points at an argument struct whose one field is the task.
+  - `capture` is the record's capture, borrowed for the call.
+  - `reuse` is null, and `ret` is the result buffer or the root's result
+    storage.
+  - The capture is the struct of the saved values at `suspend_save`'s
+    capture layout; for a start record, it is the root's explicit
+    arguments.
+  - `on_drop` is that capture's release, as for any packed callable.
+
+  Compiled functions ignore `ops`, as every compiled erased callable does.
+  The interpreter's records differ only behind the header: their function
+  is the interpreter's trampoline, and their capture carries the
+  interpreter's context.
+- **`suspend_save`.** Compiled code packs the record as above, then calls
+  the builtin `roc_builtins_task_push_record(task, record, slot_drop)`,
+  `callconv(.c)`, and the task's list takes the record's reference. The
+  saved values are read into the capture, never addressed, so a backend
+  need not treat them as address-taken. `slot_drop` is null for a
+  procedure site and for a hosted result with nothing to release.
+  Otherwise it is an adapter `fn(slot, record, ops) callconv(.c)` that
+  ignores `record` and `ops` and releases the value stored at `slot` with
+  the RC helper `suspend_save` names. Backends make that adapter the way
+  they make a capture's `on_drop`. Pushing is the statement's only effect
+  on the task.
+- **`suspend_return`.** The procedure returns without writing its result,
+  whether the result goes through a pointer or in registers. A register
+  result is left undefined. Nothing reads a result before its caller tests
+  `task_ready`, and a paused frame's result is never read. It releases what the frame owns
+  first, as ARC placed it.
+- **A suspending hosted call.** After the continuation pass, the hosted
+  procedure is `u32 f(RocTask *task, T *out, args...)`, called through
+  the platform's C ABI like any hosted function. `task` and `out` are its
+  first two C parameters, each a single pointer, never split or passed by
+  value, so the platform's header for it is stable. Its result is the host's
+  `RocPoll`: 0 is `ROC_READY` and 1 is `ROC_PENDING`. The site's switch
+  takes 0 as ready and every other value as pending. `out` is
+  `task_hosted_slot(task)`.
+- **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`,
+  `roc_task_wake` and `roc_task_free` from the builtins object linked into
+  it, so every backend links the same symbols. They are the same
+  `RocTask.host_calls` the interpreter shim exports.
+- **Builtins.** `roc_builtins_task_create` and
+  `roc_builtins_task_push_record` are registry builtins, one wrapper each,
+  that every backend declares the same way.
+
+A backend supports `Tasks` when the end-to-end fixture runs through its own
+runner against a C-ABI version of the pausing test host, with the runner
+resolving the fixture's hosted symbols to that host, and its result,
+hosted-call trace and leak check match the interpreter's, including a
+cancel at each pause. The CLI stops rejecting `concurrency: Tasks` for that
+backend in the same change. The dev backend comes first, then LLVM, then
+wasm.
+
 ### What Implements It First
 
 The first implementation supports `concurrency: Tasks` under `.lss` on the
