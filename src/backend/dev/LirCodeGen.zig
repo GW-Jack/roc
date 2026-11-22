@@ -22766,6 +22766,51 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             arg_layouts: []const layout.Idx,
             ret_layout: layout.Idx,
         ) Allocator.Error!ExportedSymbol {
+            return self.generateExportedFunction(symbol_name, .{ .entrypoint = .{
+                .proc = entry_proc,
+                .arg_layouts = arg_layouts,
+                .ret_layout = ret_layout,
+            } });
+        }
+
+        /// Generate a `Tasks` program's `roc_task_cancel(task)`: a call to the
+        /// builtin `task_cancel` with the host's `roc_task_abort` (design.md
+        /// "Backends", Cancelling). An object file defines it when the program
+        /// creates a task; a shim build's platform shim module defines it
+        /// instead.
+        pub fn generateTaskCancel(self: *Self) Allocator.Error!ExportedSymbol {
+            return self.generateExportedFunction(builtins.shim_symbols.roc_task_cancel, .task_cancel);
+        }
+
+        /// What an exported function's body does inside the frame
+        /// `generateExportedFunction` gives it.
+        const ExportedBody = union(enum) {
+            /// Call a compiled Roc proc (`generateEntrypointWrapper`).
+            entrypoint: struct {
+                proc: lir.LIR.LirProcSpecId,
+                arg_layouts: []const layout.Idx,
+                ret_layout: layout.Idx,
+            },
+            /// `roc_task_cancel` (`generateTaskCancel`).
+            task_cancel,
+        };
+
+        /// `roc_task_cancel`'s body: the task, which arrives in the first
+        /// argument register, and the address of the host's `roc_task_abort`,
+        /// passed to the builtin from the callee-saved `task_reg` and
+        /// `abort_reg`.
+        fn generateTaskCancelBody(self: *Self, task_reg: GeneralReg, abort_reg: GeneralReg) Allocator.Error!void {
+            try self.codegen.emit.movRegReg(.w64, task_reg, EmitType.CC.PARAM_REGS[0]);
+            const abort = try self.codegen.symbols.intern(self.allocator, builtins.shim_symbols.roc_task_abort, .shared);
+            try self.codegen.emitLoadDataAddress(abort_reg, abort);
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            defer builder.deinit();
+            try builder.addRegArg(task_reg);
+            try builder.addRegArg(abort_reg);
+            try self.callBuiltin(&builder, .task_cancel);
+        }
+
+        fn generateExportedFunction(self: *Self, symbol_name: []const u8, body: ExportedBody) Allocator.Error!ExportedSymbol {
             // A wrapper is an independent function. Register reservations from
             // its enclosing emitter cannot cross this procedure boundary.
             const saved_free_general = self.codegen.free_general;
@@ -22815,17 +22860,20 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const body_start = self.codegen.currentOffset();
                     const relocs_before = self.codegen.relocations.items.len;
 
-                    if (self.generation_mode.internalEntrypoints()) {
-                        // The compiler and the shim call the wrapper with the
-                        // (ret_ptr, args_ptr) convention.
-                        try self.codegen.emit.movRegReg(.w64, .X20, .X0);
-                        try self.codegen.emit.movRegReg(.w64, .X21, .X1);
-                        try self.generateEntrypointProcCall(entry_proc, arg_layouts, ret_layout, .X20, .X21);
-                    } else {
-                        // Object files export natural C-ABI entrypoints. The
-                        // incoming sret pointer (if any) is captured into X20
-                        // inside generateEntrypointBodyCAbi.
-                        try self.generateEntrypointBodyCAbi(entry_proc, arg_layouts, ret_layout, .X20, &incoming_stack_copies);
+                    switch (body) {
+                        .entrypoint => |entry| if (self.generation_mode.internalEntrypoints()) {
+                            // The compiler and the shim call the wrapper with the
+                            // (ret_ptr, args_ptr) convention.
+                            try self.codegen.emit.movRegReg(.w64, .X20, .X0);
+                            try self.codegen.emit.movRegReg(.w64, .X21, .X1);
+                            try self.generateEntrypointProcCall(entry.proc, entry.arg_layouts, entry.ret_layout, .X20, .X21);
+                        } else {
+                            // Object files export natural C-ABI entrypoints. The
+                            // incoming sret pointer (if any) is captured into X20
+                            // inside generateEntrypointBodyCAbi.
+                            try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .X20, &incoming_stack_copies);
+                        },
+                        .task_cancel => try self.generateTaskCancelBody(.X20, .X21),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();
@@ -22898,22 +22946,25 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const body_start = self.codegen.currentOffset();
                     const relocs_before = self.codegen.relocations.items.len;
 
-                    if (self.generation_mode.internalEntrypoints()) {
-                        // The compiler and the shim call the wrapper with the
-                        // (ret_ptr, args_ptr) convention.
-                        if (target.isWindows()) {
-                            try self.codegen.emit.movRegReg(.w64, .RBX, .RCX);
-                            try self.codegen.emit.movRegReg(.w64, .R13, .RDX);
+                    switch (body) {
+                        .entrypoint => |entry| if (self.generation_mode.internalEntrypoints()) {
+                            // The compiler and the shim call the wrapper with the
+                            // (ret_ptr, args_ptr) convention.
+                            if (target.isWindows()) {
+                                try self.codegen.emit.movRegReg(.w64, .RBX, .RCX);
+                                try self.codegen.emit.movRegReg(.w64, .R13, .RDX);
+                            } else {
+                                try self.codegen.emit.movRegReg(.w64, .RBX, .RDI);
+                                try self.codegen.emit.movRegReg(.w64, .R13, .RSI);
+                            }
+                            try self.generateEntrypointProcCall(entry.proc, entry.arg_layouts, entry.ret_layout, .RBX, .R13);
                         } else {
-                            try self.codegen.emit.movRegReg(.w64, .RBX, .RDI);
-                            try self.codegen.emit.movRegReg(.w64, .R13, .RSI);
-                        }
-                        try self.generateEntrypointProcCall(entry_proc, arg_layouts, ret_layout, .RBX, .R13);
-                    } else {
-                        // Object files export natural C-ABI entrypoints. The
-                        // incoming sret pointer (if any) is captured into RBX
-                        // inside generateEntrypointBodyCAbi.
-                        try self.generateEntrypointBodyCAbi(entry_proc, arg_layouts, ret_layout, .RBX, &incoming_stack_copies);
+                            // Object files export natural C-ABI entrypoints. The
+                            // incoming sret pointer (if any) is captured into RBX
+                            // inside generateEntrypointBodyCAbi.
+                            try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .RBX, &incoming_stack_copies);
+                        },
+                        .task_cancel => try self.generateTaskCancelBody(.RBX, .R13),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();

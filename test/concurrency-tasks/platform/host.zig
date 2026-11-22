@@ -4,9 +4,13 @@
 //! `roc_task_resume`. Every `roc_host_fetch` call parks: the host answers it
 //! on the next turn of its loop, writing the result to the call's `out` and
 //! waking the task. With `--finish-at-once` it answers every call during the
-//! call instead, so the same app runs both ways. It prints the result and
-//! the number of pauses, and fails the run unless every allocation it served
-//! was freed.
+//! call instead, so the same app runs both ways. With `--cancel-at N` it
+//! cancels the task through the program's `roc_task_cancel` at its Nth pause
+//! instead of answering, so the program aborts the fetch through the host's
+//! `roc_task_abort`; with `--cancel-woken-at N` it answers and wakes the task
+//! first, so the program releases the answer. It prints the result, or where
+//! it cancelled, and the number of pauses, and fails the run unless every
+//! allocation it served was freed.
 
 const std = @import("std");
 const shim_io = @import("shim_io");
@@ -78,6 +82,10 @@ const Pending = struct {
 
 var g_pending: ?Pending = null;
 var g_finish_at_once = false;
+/// The pause at which the host cancels the task, if any.
+var g_cancel_at: ?u32 = null;
+/// Whether the host answers and wakes the task before cancelling it.
+var g_cancel_woken = false;
 var g_fetches: u32 = 0;
 var g_pauses: u32 = 0;
 
@@ -125,6 +133,7 @@ extern fn roc_main(url: RocStr, result_out: *RocStr) callconv(.c) *RocTask;
 extern fn roc_task_resume(task: *RocTask) callconv(.c) u32;
 extern fn roc_task_wake(task: *RocTask) callconv(.c) void;
 extern fn roc_task_free(task: *RocTask) callconv(.c) void;
+extern fn roc_task_cancel(task: *RocTask) callconv(.c) void;
 
 // OS-specific entry point handling
 comptime {
@@ -137,9 +146,13 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
         const arg = std.mem.span(argv[i]);
         if (std.mem.eql(u8, arg, "--finish-at-once")) {
             g_finish_at_once = true;
+        } else if (std.mem.eql(u8, arg, "--cancel-at") or std.mem.eql(u8, arg, "--cancel-woken-at")) {
+            g_cancel_woken = std.mem.eql(u8, arg, "--cancel-woken-at");
+            i += 1;
+            const pause = if (i < @as(usize, @intCast(argc))) std.mem.span(argv[i]) else "";
+            g_cancel_at = std.fmt.parseInt(u32, pause, 10) catch return usage(arg);
         } else {
-            std.debug.print("Error: unknown argument '{s}'\nUsage: <app> [--finish-at-once]\n", .{arg});
-            return 1;
+            return usage(arg);
         }
     }
     platformMain() catch |err| {
@@ -147,6 +160,11 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
         return 1;
     };
     return 0;
+}
+
+fn usage(arg: []const u8) c_int {
+    std.debug.print("Error: bad argument '{s}'\nUsage: <app> [--finish-at-once | --cancel-at N | --cancel-woken-at N]\n", .{arg});
+    return 1;
 }
 
 const HostError = error{ TaskCancelled, UnexpectedStatus, Leaked };
@@ -165,16 +183,29 @@ fn platformMain() HostError!void {
         if (status != @backingInt(TaskStatus.pending)) return error.UnexpectedStatus;
         // The task paused on a fetch: answer it, then resume it.
         const pending = g_pending orelse return error.UnexpectedStatus;
-        g_pending = null;
         g_pauses += 1;
-        pending.out.* = answer(pending.url);
-        roc_task_wake(pending.task);
+        const cancelling = g_cancel_at == g_pauses;
+        if (!cancelling or g_cancel_woken) {
+            g_pending = null;
+            pending.out.* = answer(pending.url);
+            roc_task_wake(pending.task);
+        }
+        if (cancelling) {
+            // Unwoken, the program aborts the fetch through `taskAbort`.
+            roc_task_cancel(task);
+            roc_task_free(task);
+            std.debug.print("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ g_pauses, g_fetches, g_pauses });
+            return checkLeaks();
+        }
     }
     roc_task_free(task);
 
     std.debug.print("{s}\nfetches: {d}, pauses: {d}\n", .{ result.asSlice(), g_fetches, g_pauses });
     result.decref(&g_roc_ops);
+    return checkLeaks();
+}
 
+fn checkLeaks() HostError!void {
     if (g_host_env.live_allocations != 0) {
         std.debug.print("live allocations: {d}\n", .{g_host_env.live_allocations});
         return error.Leaked;

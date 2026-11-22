@@ -1394,6 +1394,9 @@ fn generatePlatformHostShimFromLirData(
     codegen.layout_store = layouts;
     defer codegen.deinit();
 
+    // A `Tasks` program's own symbols live in this module in a shim build,
+    // `roc_task_cancel` among them (design.md "Backends").
+    const defines_task_cancel = store.createsTask();
     var bitcode_result = codegen.generateInterpreterShimModule(
         "roc_platform_shim",
         shim_entrypoints,
@@ -1401,6 +1404,7 @@ fn generatePlatformHostShimFromLirData(
         package_symbols,
         embedded_lir_image,
         default_run_start,
+        defines_task_cancel,
     ) catch |err| {
         return ctx.fail(.{ .shim_generation_failed = .{ .err = err } });
     };
@@ -1427,6 +1431,7 @@ fn generatePlatformHostShimFromLirData(
     hash.update(&image_len_bytes);
     hash.update(if (embedded_lir_image != null) "embed" else "dispatch");
     hash.update(if (default_run_start) "default-run-start" else "host-provided-start");
+    hash.update(if (defines_task_cancel) "task-cancel" else "no-task-cancel");
     for (entrypoint_names) |name| {
         hash.update(name);
         hash.update(&[_]u8{0});

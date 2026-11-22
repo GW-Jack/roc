@@ -908,7 +908,8 @@ pub const MonoLlvmCodeGen = struct {
     /// Generate the interpreter platform shim module: natural C-ABI entrypoint
     /// wrappers under the provides symbols (dispatching into the prelinked
     /// interpreter), the hosted dispatch table built from the platform's
-    /// hosted-section symbols, and optionally the embedded LIR image.
+    /// hosted-section symbols, optionally the embedded LIR image, and a
+    /// `Tasks` program's `roc_task_cancel`.
     pub fn generateInterpreterShimModule(
         self: *MonoLlvmCodeGen,
         module_name: []const u8,
@@ -917,6 +918,9 @@ pub const MonoLlvmCodeGen = struct {
         package_symbols: []const []const u8,
         image: ?[]const u8,
         default_run_start: bool,
+        /// Whether the program creates a task, so the module defines its
+        /// `roc_task_cancel` (`LirStore.createsTask`).
+        defines_task_cancel: bool,
     ) Error!GenerateResult {
         self.reset();
 
@@ -1022,6 +1026,8 @@ pub const MonoLlvmCodeGen = struct {
                 .{ .entry_index = entrypoint.entry_index, .image = image_ref },
             );
         }
+
+        if (defines_task_cancel) try self.defineTaskCancel();
 
         if (default_run_start) {
             try self.emitDefaultRunStartModuleAsm(&builder);
@@ -5482,7 +5488,16 @@ pub const MonoLlvmCodeGen = struct {
             }
             wip.finish() catch return error.OutOfMemory;
         }
+        try self.defineTaskCancel();
+    }
 
+    /// Define `roc_task_cancel(task)`, a call to the builtin `task_cancel`
+    /// with the host's `roc_task_abort` (design.md "Backends", Cancelling):
+    /// in a `Tasks` program's module, or in the platform shim module of a
+    /// shim build, whose shim archive defines the builtin.
+    fn defineTaskCancel(self: *MonoLlvmCodeGen) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const ptr_ty = try self.ptrType();
         const cancel = try self.declareBuiltin(.task_cancel, .void, &.{ ptr_ty, ptr_ty });
         const abort_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
         const abort = try self.declareHostSymbol(builtins.shim_symbols.roc_task_abort, abort_ty);

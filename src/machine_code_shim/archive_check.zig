@@ -38,11 +38,13 @@ const exports = [_][]const u8{
     symbols.roc_shim_get_ops,
     symbols.roc_entrypoint,
     symbols.roc_shim_default_main,
-    // A `Tasks` platform's host drives its tasks with these; the shim defines
-    // them because the archive links no builtins object.
+    // A `Tasks` platform's host drives its tasks with these, and a shim
+    // build's `roc_task_cancel` calls the builtin; the shim defines them
+    // because the archive links no builtins object.
     symbols.roc_task_resume,
     symbols.roc_task_wake,
     symbols.roc_task_free,
+    symbols.roc_builtins_task_cancel,
 };
 const imports = symbols.runtime_set ++ .{
     symbols.roc_shim_hosted_fns,

@@ -33992,12 +33992,22 @@ byte:
   `roc_task_abort` as `abort`; the builtin is `RocTask.cancel`. A `Tasks`
   program defines it where the program's own symbols live:
   - LLVM, in the program's module, beside the other three calls;
+  - the dev backend's object file (`roc build --opt=dev`), beside its
+    entrypoint wrappers, in the same frame they get. The builtins object it
+    links defines the other three calls in every payload;
   - wasm, in the final module, which imports `roc_task_abort` from `env`
     like a hosted function, puts it in the table, and exports
     `roc_task_cancel`;
   - a shim build (the interpreter's, or the dev backend's run image), in the
-    generated platform shim module, which the CLI generates knowing the
-    platform's mode.
+    generated platform shim module, which the CLI generates knowing whether
+    the program creates a task (`LirStore.createsTask`). The shim archive
+    defines the builtin: the interpreter shim's builtins object exports
+    every core wrapper, and the machine-code shim exports
+    `roc_builtins_task_cancel` beside the three calls.
+
+  The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
+  chosen pause, before and after waking the task, on every backend the CLI
+  runs, and fails the run on a leak.
 - **Wasm.** Wasm checks the type of every indirect call, so nothing may
   stand in for a function of another signature:
   - each `slot_drop` helper gets its own adapter of the `fn(slot, record,

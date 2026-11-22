@@ -2099,6 +2099,16 @@ pub fn getCFStmts(self: *const Self) []const CFStmt {
     return self.cf_stmts.unsafeRawItemsForView();
 }
 
+/// Whether the program creates a task, so it defines the host's task calls,
+/// `roc_task_cancel` among them (design.md "Backends").
+pub fn createsTask(self: *const Self) bool {
+    for (self.getCFStmts()) |stmt| {
+        if (stmt != .assign_low_level) continue;
+        if (stmt.assign_low_level.op == .task_create) return true;
+    }
+    return false;
+}
+
 /// Returns the stored statement for the given id.
 pub fn getCFStmt(self: *const Self, id: CFStmtId) CFStmt {
     self.verifyCFStmtId(id);

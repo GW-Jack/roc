@@ -7918,19 +7918,9 @@ pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcS
             .symbol = imported.symbol,
         });
     }
-    if (self.task_abort == null and self.createsTask()) {
+    if (self.task_abort == null and self.store.createsTask()) {
         self.task_abort = try self.resolveSymbolTarget(builtins.shim_symbols.roc_task_abort, &.{.i32}, &.{});
     }
-}
-
-/// Whether the program creates a task, and so is a `Tasks` program that
-/// defines `roc_task_cancel` over the host's `roc_task_abort`.
-fn createsTask(self: *const Self) bool {
-    for (self.store.getCFStmts()) |stmt| {
-        if (stmt != .assign_low_level) continue;
-        if (stmt.assign_low_level.op == .task_create) return true;
-    }
-    return false;
 }
 
 /// The wasm C-ABI signature of a procedure called through the platform C

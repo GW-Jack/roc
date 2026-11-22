@@ -39,6 +39,9 @@ pub const roc_task_free = "roc_task_free";
 pub const roc_task_cancel = "roc_task_cancel";
 /// The host's: abandon the operation a cancelled task is parked on.
 pub const roc_task_abort = "roc_task_abort";
+/// The registry builtin `task_cancel`, which the shims export so a shim
+/// build's platform shim module can define `roc_task_cancel` over it.
+pub const roc_builtins_task_cancel = "roc_builtins_task_cancel";
 /// The hosted dispatch table defined by the generated platform shim module.
 pub const roc_shim_hosted_fns = "roc_shim_hosted_fns";
 /// Number of entries in `roc_shim_hosted_fns`.

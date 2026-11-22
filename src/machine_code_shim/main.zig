@@ -1027,12 +1027,17 @@ comptime {
     // A `Tasks` platform's host drives the tasks its provides entries return.
     // This archive links no builtins object (the program's builtins load
     // with its image), so the shim is what defines the host's task calls in
-    // the binary (design.md "Host Contract"). The shim's unit tests link
+    // the binary (design.md "Host Contract"), and the builtin the platform
+    // shim module's `roc_task_cancel` calls. The shim's unit tests link
     // roc_builtins.o in place of the image, and it defines them there.
     if (!builtin.is_test) {
         @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
         @export(&builtins.task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
         @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+        @export(&builtins.dev_wrappers.roc_builtins_task_cancel, .{ .name = shim_symbols.roc_builtins_task_cancel });
+    }
+    if (!std.mem.eql(u8, shim_symbols.roc_builtins_task_cancel, builtins.builtin_registry.BuiltinFn.task_cancel.symbolName())) {
+        @compileError("shim_symbols.roc_builtins_task_cancel must name the registry builtin task_cancel");
     }
 }
 
