@@ -34087,7 +34087,9 @@ allocations. The `test/concurrency-tasks` platform's native host is such a
 pausing host. It parks every `fetch!`, finishes it on the next turn of its
 loop, and fails the run unless every allocation it served was freed, so
 `roc run` runs that program through the CLI against it, on every backend
-that supports `Tasks`. A program built for a platform that marks its hosted functions
+that supports `Tasks`. An executable that `roc build` makes for that
+platform on a compiling backend is run the same way, so the build path's
+link of the host's task calls is tested too. A program built for a platform that marks its hosted functions
 `suspending` must give the LIR it gets without the marks, apart from the
 task arguments, the hosted calls' new shape, the pending tests and edges,
 and the continuations and resume entries. A Python model of the design

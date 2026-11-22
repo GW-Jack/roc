@@ -515,7 +515,34 @@ const PlatformCase = struct {
         io_spec: []const u8,
         /// Build for the named cross-compilation target without running.
         cross_compile: []const u8,
+        /// Build natively under lambda-set specialization, whatever the
+        /// runner's `--specialize`, and run with host arguments.
+        specialized_run: SpecializedRun,
     };
+
+    /// A run of a program that only lowers under lambda-set specialization,
+    /// such as a `concurrency: Tasks` one.
+    const SpecializedRun = struct {
+        /// Arguments the host gets after the app's file.
+        app_args: []const []const u8 = &.{},
+        /// Text the run's stderr must contain.
+        stderr_contains: []const u8,
+    };
+
+    fn specializationArg(self: PlatformCase) ?[]const u8 {
+        return switch (self.test_kind) {
+            .specialized_run => "--specialize=yes",
+            .native_run, .io_spec, .cross_compile => platform_specialization_arg,
+        };
+    }
+
+    /// The text a passing run's stderr must contain, if any.
+    fn runStderrContains(self: PlatformCase) ?[]const u8 {
+        return switch (self.test_kind) {
+            .specialized_run => |run| run.stderr_contains,
+            .native_run, .io_spec, .cross_compile => null,
+        };
+    }
 };
 
 const GlueRuntimeTarget = enum(u8) {
@@ -3221,6 +3248,15 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run runs a concurrency Tasks program on the dev backend against a host that finishes every fetch at once", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app.roc", .app_args = &.{"--finish-at-once"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 0\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run resumes a concurrency Tasks program paused inside an app procedure on the dev backend", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .app_args = &.{}, .contains = &.{.{ .stream = .stderr, .text = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 2\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run runs a concurrency Tasks program with two fetches on the dev backend against a host that finishes them at once", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .app_args = &.{"--finish-at-once"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 0\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    // `roc build` links the host's task calls into the executable itself; these run that executable.
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that runs against a host that pauses at every fetch", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 1\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that runs against a host that finishes every fetch at once", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 0\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that resumes inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 2\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that runs with two fetches against a host that finishes them at once", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 0\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs against a host that pauses at every fetch", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 1\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs against a host that finishes every fetch at once", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 0\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that resumes inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 2\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs with two fetches against a host that finishes them at once", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 0\n" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check writes parse errors to stderr", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains_any = &.{.{ .needles = &parse_error_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "direct roc rejects compiler-owned glue platform as hostless", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "src/glue/src/DebugGlue.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{ .{ .stream = .stderr, .text = "empty targets section" }, .{ .stream = .stderr, .text = "roc glue" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "expected platform string" }, .{ .stream = .stderr, .text = "panic" }, .{ .stream = .stderr, .text = "unreachable" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check displays correct file path in parse error messages", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{.{ .stream = .stderr, .text = "has_parse_error.roc" }}, .not_contains = &.{.{ .stream = .stderr, .text = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa" }} } } },
@@ -6585,7 +6621,7 @@ fn runPlatformCase(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: 
 
     const result = switch (platform.test_kind) {
         .cross_compile => |target| runCrossCompileTest(io, allocator, target, platform, roc_file, output_name, &env_map, dirs.work_dir, &timer, timeout_ms),
-        .native_run, .io_spec => blk: {
+        .native_run, .io_spec, .specialized_run => blk: {
             const backend = spec.backend orelse
                 break :blk TestResult{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "platform case missing backend" };
             break :blk switch (backend) {
@@ -6616,38 +6652,24 @@ fn runInterpreterTest(
     const opt_arg = std.fmt.allocPrint(allocator, "--opt={s}", .{backend.cliName()}) catch
         return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate opt arg" };
 
-    var argv_buf: [7][]const u8 = undefined;
-    var argc: usize = 0;
-    argv_buf[argc] = roc_binary_path;
-    argc += 1;
-    argv_buf[argc] = "run";
-    argc += 1;
-    argv_buf[argc] = opt_arg;
-    argc += 1;
-    if (platform_specialization_arg) |specialization_arg| {
-        argv_buf[argc] = specialization_arg;
-        argc += 1;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.appendSlice(allocator, &.{ roc_binary_path, "run", opt_arg }) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate run argv" };
+    if (platform.specializationArg()) |specialization_arg| {
+        argv.append(allocator, specialization_arg) catch
+            return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate run argv" };
     }
-    argv_buf[argc] = roc_file;
-    argc += 1;
-    switch (platform.test_kind) {
-        .native_run => {},
-        .io_spec => |io_spec| {
-            // App args follow the app's file, so the CLI forwards them to the
-            // host; the host takes `--test <spec>` as two arguments, matching
-            // the built-executable path below.
-            argv_buf[argc] = "--test";
-            argc += 1;
-            argv_buf[argc] = io_spec;
-            argc += 1;
-        },
-        .cross_compile => unreachable, // runSingleTest sends cross_compile cases to runCrossCompileTest instead
-    }
+    argv.append(allocator, roc_file) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate run argv" };
+    // App args follow the app's file, so the CLI forwards them to the host,
+    // as the built-executable path below passes them.
+    appendAppArgs(allocator, &argv, platform) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate run argv" };
 
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .message = "no clock" };
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before run command started");
-    const run_result = util.runChildWithTimeout(io, allocator, argv_buf[0..argc], .{
+    const run_result = util.runChildWithTimeout(io, allocator, argv.items, .{
         .cwd = work_dir,
         .env_map = env_map,
         .max_output_bytes = 10 * 1024 * 1024,
@@ -6657,7 +6679,32 @@ fn runInterpreterTest(
         return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .run_ns = run_timer.read(), .message = msg };
     };
     const run_ns = run_timer.read();
-    return resultFromProcess(run_result, timer, .run, 0, run_ns, "run failed");
+    return checkRunStderr(allocator, platform, run_result, resultFromProcess(run_result, timer, .run, 0, run_ns, "run failed"));
+}
+
+/// Append the arguments the host gets after the app's file.
+fn appendAppArgs(allocator: Allocator, argv: *std.ArrayListUnmanaged([]const u8), platform: PlatformCase) Allocator.Error!void {
+    switch (platform.test_kind) {
+        .native_run => {},
+        // The host takes `--test <spec>` as two arguments.
+        .io_spec => |io_spec| try argv.appendSlice(allocator, &.{ "--test", io_spec }),
+        .specialized_run => |run| try argv.appendSlice(allocator, run.app_args),
+        .cross_compile => unreachable, // runSingleTest sends cross_compile cases to runCrossCompileTest instead
+    }
+}
+
+/// Fail a passing run whose stderr lacks the text its case expects.
+fn checkRunStderr(allocator: Allocator, platform: PlatformCase, run_result: std.process.RunResult, result: TestResult) TestResult {
+    if (result.status != .pass) return result;
+    const needle = platform.runStderrContains() orelse return result;
+    if (std.mem.find(u8, run_result.stderr, needle) != null) return result;
+    var failed = result;
+    failed.status = .run_failed;
+    failed.exit_code = exitCode(run_result.term);
+    failed.stderr_capture = run_result.stderr;
+    failed.stdout_capture = run_result.stdout;
+    failed.message = std.fmt.allocPrint(allocator, "missing expected run stderr: {s}", .{needle}) catch "missing expected run stderr";
+    return failed;
 }
 
 fn runCompiledTest(
@@ -6687,7 +6734,7 @@ fn runCompiledTest(
     build_argc += 1;
     build_argv_buf[build_argc] = opt_arg;
     build_argc += 1;
-    if (platform_specialization_arg) |specialization_arg| {
+    if (platform.specializationArg()) |specialization_arg| {
         build_argv_buf[build_argc] = specialization_arg;
         build_argc += 1;
     }
@@ -6733,25 +6780,16 @@ fn runCompiledTest(
         return .{ .status = .build_failed, .phase = .build, .duration_ns = timer.read(), .build_ns = build_ns, .message = "build succeeded but output file was not created" };
     }
 
-    var run_argv_buf: [3][]const u8 = undefined;
-    var argc: usize = 0;
-    run_argv_buf[argc] = output_name;
-    argc += 1;
-    switch (platform.test_kind) {
-        .native_run => {},
-        .io_spec => |io_spec| {
-            run_argv_buf[argc] = "--test";
-            argc += 1;
-            run_argv_buf[argc] = io_spec;
-            argc += 1;
-        },
-        .cross_compile => unreachable, // runSingleTest sends cross_compile cases to runCrossCompileTest instead
-    }
+    var run_argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    run_argv.append(allocator, output_name) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .build_ns = build_ns, .message = "failed to allocate run argv" };
+    appendAppArgs(allocator, &run_argv, platform) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .build_ns = build_ns, .message = "failed to allocate run argv" };
 
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .build_ns = build_ns, .message = "no clock" };
     const run_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before compiled output started");
-    const run_result = util.runChildWithTimeout(io, allocator, run_argv_buf[0..argc], .{
+    const run_result = util.runChildWithTimeout(io, allocator, run_argv.items, .{
         .cwd = work_dir,
         .max_output_bytes = 10 * 1024 * 1024,
         .timeout_ms = run_timeout_ms,
@@ -6760,7 +6798,7 @@ fn runCompiledTest(
         return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .build_ns = build_ns, .run_ns = run_timer.read(), .message = msg };
     };
     const run_ns = run_timer.read();
-    return resultFromProcess(run_result, timer, .run, build_ns, run_ns, "run failed");
+    return checkRunStderr(allocator, platform, run_result, resultFromProcess(run_result, timer, .run, build_ns, run_ns, "run failed"));
 }
 
 fn runCrossCompileTest(
