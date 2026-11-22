@@ -58,6 +58,31 @@ pub const host_calls = struct {
     }
 };
 
+/// Where compiled code finds the three fields the `task_*` low-level
+/// operations reach, for a target whose pointers are `pointer_size` bytes
+/// (design.md "Backends"): `pending` first, then the two buffer pointers,
+/// each at the next pointer-aligned offset. The comptime check below holds
+/// `RocTask` to it.
+pub const FieldOffsets = struct {
+    pending: u32,
+    hosted_slot: u32,
+    result_buffer: u32,
+
+    /// The offsets on a target with `pointer_size`-byte pointers.
+    pub fn forPointerSize(pointer_size: u32) FieldOffsets {
+        return .{ .pending = 0, .hosted_slot = pointer_size, .result_buffer = 2 * pointer_size };
+    }
+};
+
+comptime {
+    const native = FieldOffsets.forPointerSize(@sizeOf(usize));
+    if (@offsetOf(RocTask, "pending") != native.pending or
+        @offsetOf(RocTask, "hosted_slot") != native.hosted_slot or
+        @offsetOf(RocTask, "result_buffer") != native.result_buffer or
+        @sizeOf(@FieldType(RocTask, "pending")) != 1)
+        @compileError("RocTask's first three fields moved; compiled code reads them at FieldOffsets");
+}
+
 /// One task. The runtime owns it; LIR holds a pointer to it with no
 /// reference count.
 pub const RocTask = extern struct {
@@ -406,5 +431,46 @@ test "the host's C calls resume, wake and free a task and report its status as a
     try std.testing.expectEqual(@as(u32, 1), host_calls.resumeTask(task));
     try std.testing.expectEqual(@as(u8, 20), root[0]);
     host_calls.free(task);
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "FieldOffsets is where RocTask keeps its first three fields, scaled by the pointer size" {
+    const native = FieldOffsets.forPointerSize(@sizeOf(usize));
+    try std.testing.expectEqual(@as(usize, native.pending), @offsetOf(RocTask, "pending"));
+    try std.testing.expectEqual(@as(usize, native.hosted_slot), @offsetOf(RocTask, "hosted_slot"));
+    try std.testing.expectEqual(@as(usize, native.result_buffer), @offsetOf(RocTask, "result_buffer"));
+    try std.testing.expectEqual(FieldOffsets{ .pending = 0, .hosted_slot = 4, .result_buffer = 8 }, FieldOffsets.forPointerSize(4));
+}
+
+test "compiled code's task builtins create a task with the entered ops and push records onto its list" {
+    const dev_wrappers = @import("dev_wrappers.zig");
+    const in_process_host = @import("in_process_host.zig");
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    const saved_host = in_process_host.enter(ops, null);
+    defer in_process_host.leave(saved_host);
+    TestLog.reset();
+
+    var root: [1]u8 = .{0};
+    const start = testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 10 });
+    const task = dev_wrappers.roc_builtins_task_create(start, &root, 16, 8, 24, 8);
+    try std.testing.expectEqual(ops, task.ops);
+    try std.testing.expectEqual(@as(usize, 16), task.hosted_slot_size);
+    try std.testing.expectEqual(@as(usize, 24), task.result_buffer_size);
+    try std.testing.expectEqual(@as(usize, 1), task.len);
+    try std.testing.expectEqual(start, task.entries[0].record);
+
+    const record = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    dev_wrappers.roc_builtins_task_push_record(task, record, &testSlotDrop);
+    try std.testing.expectEqual(@as(usize, 2), task.len);
+    try std.testing.expectEqual(record, task.entries[1].record);
+    try std.testing.expectEqual(@as(?SlotDropFn, &testSlotDrop), task.entries[1].slot_drop);
+
+    // Parked and never resumed: cancelling releases both records.
+    task.setPending();
+    task.cancel(&testAbort);
+    try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
+    task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }

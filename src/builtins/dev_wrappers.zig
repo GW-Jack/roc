@@ -30,6 +30,7 @@ const FromUtf8Try = str.FromUtf8Try;
 // which has a tracy dependency. The actual struct layout is handled by utils.zig.
 const RocOps = utils.RocOps;
 const in_process_host = @import("in_process_host.zig");
+const task = @import("task.zig");
 
 /// Field offsets for the dev backend's `Str.split_first` result copy.
 pub const StrSplitFirstLayout = extern struct {
@@ -1395,6 +1396,26 @@ pub fn roc_builtins_erased_callable_repack(reuse: ?[*]u8, callable_fn_ptr: erase
 pub fn roc_builtins_erased_callable_free(payload_ptr: ?[*]u8) callconv(.c) void {
     const roc_ops = in_process_host.ops();
     erased_callable.free(payload_ptr, roc_ops);
+}
+
+/// `task_create` (design.md "Backends"): a new task whose list holds `start`,
+/// which it takes, and whose root result goes to `root_result`. The task keeps
+/// the builtin ops for its whole life, which outlive it: the process's host
+/// ops in a platform, the entered evaluation's in-process.
+pub fn roc_builtins_task_create(start: [*]u8, root_result: [*]u8, hosted_slot_size: u64, hosted_slot_alignment: u64, result_buffer_size: u64, result_buffer_alignment: u64) callconv(.c) *task.RocTask {
+    return task.RocTask.create(in_process_host.ops(), start, root_result, .{
+        .hosted_slot_size = @intCast(hosted_slot_size),
+        .hosted_slot_alignment = @intCast(hosted_slot_alignment),
+        .result_buffer_size = @intCast(result_buffer_size),
+        .result_buffer_alignment = @intCast(result_buffer_alignment),
+    });
+}
+
+/// What `suspend_save` does with the record it packs: the task's list takes
+/// the record's one reference, with the hosted result's release for a hosted
+/// site's record.
+pub fn roc_builtins_task_push_record(roc_task: *task.RocTask, record: [*]u8, slot_drop: ?task.SlotDropFn) callconv(.c) void {
+    roc_task.pushRecord(record, slot_drop);
 }
 
 /// Enter the loaded dev-shim code image that contains the generated callsite.
