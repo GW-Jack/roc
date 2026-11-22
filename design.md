@@ -33985,6 +33985,23 @@ byte:
   machine-code shim the host links defines the three calls instead. The
   runtime keeps nothing outside the task that a second copy would split, so the shim's copy and the
   image's agree on every task.
+- **Wasm.** Wasm checks the type of every indirect call, so nothing may
+  stand in for a function of another signature:
+  - each `slot_drop` helper gets its own adapter of the `fn(slot, record,
+    ops)` type, a function that calls the helper with the slot and the ops.
+    The adapters are registered, with their table slots, before any body is
+    generated, because a body worker creates no module entity;
+  - `suspend_return` in a procedure with a value result returns zero, not
+    an unset local. A caller copies a returned aggregate out of the address
+    it gets back before it tests `task_ready`, and an unset address could
+    lie outside memory. The pass puts `suspend_return` only in Roc-ABI
+    procedures: a record reaches its continuation, and the start record its
+    root, at a tail site, and an erased-ABI procedure stores its result
+    through `ret` after its body.
+
+  A final wasm module exports the merged builtins' `roc_task_resume`,
+  `roc_task_wake` and `roc_task_free` by those names, next to its
+  entrypoints.
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
   that every backend declares the same way.

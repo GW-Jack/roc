@@ -4948,6 +4948,13 @@ pub fn build(b: *std.Build) void {
     });
 
     test_suites.register(.{
+        .step_suffix = "task-ops-wasm",
+        .description = "Run task operation wasm backend Zig tests",
+        .compile = compiler_suites_test,
+        .namespace = "eval.test.task_ops_wasm_test.",
+    });
+
+    test_suites.register(.{
         .step_suffix = "cli-main",
         .description = "Run roc CLI main Zig tests",
         .compile = compiler_suites_test,

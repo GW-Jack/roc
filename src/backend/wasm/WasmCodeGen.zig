@@ -220,6 +220,8 @@ const LayoutStore = layout.Store;
 const RuntimeDiagnostic = enum { dbg, expect_failed, crashed };
 const wasm_erased_callable_on_drop_offset: u32 = 4;
 const wasm_erased_callable_capture_offset = builtins.erased_callable.captureOffset(4);
+/// Where the `task_*` low-level operations find the task's fields.
+const task_field_offsets = builtins.task.FieldOffsets.forPointerSize(wasm_word_size);
 
 const Self = @This();
 
@@ -376,6 +378,10 @@ proc_arg_counts_offset: u32 = 0,
 tail_area: ?DataAddress = null,
 /// One driver function per tail group and result type.
 tail_drivers: std.ArrayList(TailDriver) = .empty,
+/// The `fn(slot, record, ops)` adapter over each RC helper a `suspend_save`
+/// names as its slot release, by the helper's atomic cache key, registered
+/// with its table slot before any body is generated (design.md "Backends").
+slot_drop_adapters: std.AutoArrayHashMapUnmanaged(u64, SlotDropAdapter) = .empty,
 /// Where the current proc keeps its return value until epilogue time: a wasm
 /// local, or in split mode a frame slot every function of the family reads.
 proc_return: Storage.LocalInfo = .{ .idx = 0, .val_type = .i32 },
@@ -631,6 +637,7 @@ pub fn deinit(self: *Self) void {
     self.registered_procs.deinit();
     for (self.tail_drivers.items) |*driver| driver.members.deinit(self.allocator);
     self.tail_drivers.deinit(self.allocator);
+    self.slot_drop_adapters.deinit(self.allocator);
     self.hosted_symbol_targets.deinit();
     self.function_symbols_by_index.deinit();
     for (self.function_symbol_names.items) |name| {
@@ -2023,19 +2030,112 @@ pub fn generateEntrypointWrapper(
     return func_idx;
 }
 
-/// Generate a complete wasm module for a zero-argument root proc.
-/// The exported `main` function sets up the stack frame and calls the root proc.
-/// Builtin call sites target definitions merged from `wasm32_builtins_object`.
-/// Dead-code elimination drops the merged definitions nothing reaches, so the
-/// encoded module imports only the reachable platform runtime callbacks.
-pub fn generateModule(
+/// Finish a final module whose wrappers and exports are in place: resolve
+/// its relocations, drop what no export reaches, and encode it.
+fn finishFinalModule(self: *Self) Allocator.Error![]u8 {
+    self.module.resolveRelocations() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidRelocation => wasmInvariantFmt(
+            "WASM/codegen invariant violated: generated module contains an invalid relocation",
+            .{},
+        ),
+    };
+
+    // Exports, init functions and element-section entries seed the live
+    // set; no other function is seeded.
+    self.module.eliminateDeadCode(&.{}) catch return error.OutOfMemory;
+    var hosted: std.ArrayList([]const u8) = .empty;
+    defer hosted.deinit(self.allocator);
+    for (self.store.getProcSpecs()) |spec| {
+        const hosted_proc = spec.hosted.get() orelse continue;
+        try hosted.append(self.allocator, self.store.getString(hosted_proc.symbol));
+    }
+    self.module.verifyNoBuiltinImports(hosted.items) catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
+    };
+    try self.module.materializeFuncBodies();
+
+    return self.module.encode(self.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NonZeroZeroFillSegment => wasmInvariantFmt("WASM/codegen invariant violated: eval module contains nonzero omitted data", .{}),
+    };
+}
+
+/// Reserve static data and the compiler stack in initial memory. The host
+/// heap begins after both regions and grows memory upward, so it cannot
+/// collide with the downward-growing stack. Returns where the heap begins.
+fn finalizeFinalModuleMemory(self: *Self) Allocator.Error!u32 {
+    try self.module.finalizeMemoryAndTableWithConfig(.{
+        .stack_bytes = self.wasm_stack_bytes,
+        .minimum_memory = if (self.wasm_memory_pages > 0)
+            @as(usize, self.wasm_memory_pages) * 65536
+        else
+            null,
+        .export_memory = true,
+    });
+    return self.module.initialMemoryByteLen();
+}
+
+/// A platform entrypoint a final module exports under `symbol_name`.
+pub const ModuleEntrypoint = struct {
+    symbol_name: []const u8,
+    proc: LIR.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    ret_layout: layout.Idx,
+};
+
+/// A final module with platform entrypoints, and where its host heap begins.
+pub const EntrypointModule = struct {
+    wasm_bytes: []u8,
+    heap_base: u32,
+    has_imports: bool,
+};
+
+/// Generate a complete wasm module that exports each of `entrypoints`
+/// through its C-ABI wrapper, and each merged runtime function named in
+/// `runtime_exports` (a `Tasks` program's `roc_task_*` calls, for one) by
+/// its own name. Its imports are the runtime and hosted functions.
+pub fn generateEntrypointModule(
     self: *Self,
-    root_proc_id: LIR.LirProcSpecId,
-    result_layout: layout.Idx,
+    entrypoints: []const ModuleEntrypoint,
+    runtime_exports: []const []const u8,
     wasm32_builtins_object: []const u8,
     wasm32_boxy_runtime_object: []const u8,
-) HostedSymbolError!GenerateResult {
-    // generateModule always runs data DCE, so every generated static-data
+) HostedSymbolError!EntrypointModule {
+    try self.prepareFinalModule(wasm32_builtins_object, wasm32_boxy_runtime_object);
+    const wrappers = try self.allocator.alloc(u32, entrypoints.len);
+    defer self.allocator.free(wrappers);
+    for (entrypoints, wrappers) |entry, *wrapper| {
+        wrapper.* = try self.generateEntrypointWrapper(entry.symbol_name, entry.proc, entry.arg_layouts, entry.ret_layout);
+    }
+    const heap_base = try self.finalizeFinalModuleMemory();
+    try self.flushPendingBodies();
+    for (entrypoints, wrappers) |entry, wrapper| {
+        self.module.addExport(entry.symbol_name, .func, wrapper) catch return error.OutOfMemory;
+    }
+    for (runtime_exports) |name| {
+        const symbol = self.module.findDefinedFunctionSymbolExact(name) catch |err| wasmInvariantFmt(
+            "WASM/codegen invariant violated: runtime export {s} is not one merged function: {s}",
+            .{ name, @errorName(err) },
+        );
+        self.module.addExport(name, .func, self.functionIndexForSymbol(symbol)) catch return error.OutOfMemory;
+    }
+    return .{
+        .wasm_bytes = try self.finishFinalModule(),
+        .heap_base = heap_base,
+        .has_imports = self.module.importCount() > 0,
+    };
+}
+
+/// The steps every final module shares before its wrappers: merge the
+/// builtins (and, for a `.boxy` program, the Boxy runtime) and compile every
+/// procedure.
+fn prepareFinalModule(
+    self: *Self,
+    wasm32_builtins_object: []const u8,
+    wasm32_boxy_runtime_object: []const u8,
+) HostedSymbolError!void {
+    // A final module always runs data DCE, so every generated static-data
     // address must carry the relocation edge that makes its segment live.
     self.configureStaticDataAddressTracking();
 
@@ -2105,13 +2205,28 @@ pub fn generateModule(
         });
     }
 
-    // Compile all procedures before the synthetic main wrapper.
+    // Compile all procedures before the module's own wrappers.
     const proc_specs = self.store.getProcSpecs();
     if (proc_specs.len > 0) {
         self.compileAllProcSpecs(proc_specs) catch return error.OutOfMemory;
     }
     // Frozen callables can name a drop helper that no procedure body calls.
     try self.compileStaticDataRcHelpers(self.static_data_rc_helpers);
+}
+
+/// Generate a complete wasm module for a zero-argument root proc.
+/// The exported `main` function sets up the stack frame and calls the root proc.
+/// Builtin call sites target definitions merged from `wasm32_builtins_object`.
+/// Dead-code elimination drops the merged definitions nothing reaches, so the
+/// encoded module imports only the reachable platform runtime callbacks.
+pub fn generateModule(
+    self: *Self,
+    root_proc_id: LIR.LirProcSpecId,
+    result_layout: layout.Idx,
+    wasm32_builtins_object: []const u8,
+    wasm32_boxy_runtime_object: []const u8,
+) HostedSymbolError!GenerateResult {
+    try self.prepareFinalModule(wasm32_builtins_object, wasm32_boxy_runtime_object);
 
     const root_proc = self.store.getProcSpec(root_proc_id);
     if (!root_proc.args.isEmpty()) {
@@ -2146,18 +2261,7 @@ pub fn generateModule(
     try self.emitCall(root_func_idx);
     try self.emitTailDrive(self.store.getProcSpec(root_proc_id));
 
-    // Reserve static data and the compiler stack in initial memory. The host
-    // heap begins after both regions and grows memory upward, so it cannot
-    // collide with the downward-growing stack.
-    try self.module.finalizeMemoryAndTableWithConfig(.{
-        .stack_bytes = self.wasm_stack_bytes,
-        .minimum_memory = if (self.wasm_memory_pages > 0)
-            @as(usize, self.wasm_memory_pages) * 65536
-        else
-            null,
-        .export_memory = true,
-    });
-    const heap_base = self.module.initialMemoryByteLen();
+    const heap_base = try self.finalizeFinalModuleMemory();
     self.uses_stack_memory = true;
 
     self.finalizeStackFrameSize();
@@ -2199,26 +2303,7 @@ pub fn generateModule(
     self.endFunction();
     try self.flushPendingBodies();
     self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
-    self.module.resolveRelocations() catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidRelocation => wasmInvariantFmt(
-            "WASM/codegen invariant violated: generated module contains an invalid relocation",
-            .{},
-        ),
-    };
-
-    // Exports, init functions and element-section entries seed the live
-    // set; no other function is seeded.
-    self.module.eliminateDeadCode(&.{}) catch return error.OutOfMemory;
-    self.module.verifyNoBuiltinImports() catch {
-        wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
-    };
-    try self.module.materializeFuncBodies();
-
-    const wasm_bytes = self.module.encode(self.allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NonZeroZeroFillSegment => wasmInvariantFmt("WASM/codegen invariant violated: eval module contains nonzero omitted data", .{}),
-    };
+    const wasm_bytes = try self.finishFinalModule();
 
     return .{
         .wasm_bytes = wasm_bytes,
@@ -6414,9 +6499,97 @@ pub fn compileAllProcSpecs(self: *Self, proc_specs: []const LirProcSpec) Allocat
     }
     try self.buildProcArgCountsTable(proc_specs);
     try self.registerTailDrivers(proc_specs);
+    try self.registerSlotDropAdapters(proc_specs);
     // Pass 2: Generate proc bodies, committing them in spec-id order.
     try self.compileProcBodies(proc_specs);
     try self.compileTailDrivers();
+    try self.compileSlotDropAdapters();
+}
+
+/// A slot-release adapter: its function, its table slot, and the RC helper
+/// it calls.
+const SlotDropAdapter = struct {
+    helper: RcHelperKey,
+    defined: index_types.DefinedFunction,
+    table_idx: u32,
+    /// Whether its body is emitted: a later `compileAllProcSpecs` adds to the
+    /// adapters an earlier one compiled.
+    compiled: bool = false,
+};
+
+/// Register an adapter, with its table slot, for each slot release a
+/// `suspend_save` names. A body worker creates no module entity, so every
+/// adapter exists before any body is generated. Only a program with a
+/// procedure that may suspend has a `suspend_save`.
+fn registerSlotDropAdapters(self: *Self, proc_specs: []const LirProcSpec) Allocator.Error!void {
+    for (proc_specs) |proc| {
+        if (proc.suspends == .may) break;
+    } else return;
+    for (self.store.getCFStmts()) |stmt| {
+        if (stmt != .suspend_save) continue;
+        const save_stmt = stmt.suspend_save;
+        const helper = switch (self.store.stmtRow(save_stmt.data).slot_drop) {
+            .none => continue,
+            .rc_helper => |helper| helper,
+        };
+        if (self.getLayoutStore().rcHelperPlan(helper) == .noop) {
+            wasmInvariantFmt("WASM/codegen invariant violated: suspend_save names a slot release for layout {d}, which holds nothing refcounted", .{@backingInt(helper.layout_idx)});
+        }
+        const entry = try self.slot_drop_adapters.getOrPut(self.allocator, rcHelperCacheKey(helper, .atomic));
+        if (entry.found_existing) continue;
+        const type_idx = try self.internFuncType(&.{ .i32, .i32, .i32 }, &.{});
+        const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
+        _ = try self.addOwnedLocalFunctionSymbol(defined, "roc_slot_drop", self.slot_drop_adapters.count() - 1);
+        const table_idx = self.module.addTableElement(defined.function.raw()) catch return error.OutOfMemory;
+        entry.value_ptr.* = .{ .helper = helper, .defined = defined, .table_idx = table_idx };
+    }
+}
+
+/// The table slot of the slot-release adapter for `slot_drop`, or null for
+/// a site with nothing to release.
+fn slotDropTableIndex(self: *const Self, slot_drop: LIR.ErasedCallableOnDrop) ?u32 {
+    const helper = switch (slot_drop) {
+        .none => return null,
+        .rc_helper => |helper| helper,
+    };
+    const adapter = self.tables().slot_drop_adapters.get(rcHelperCacheKey(helper, .atomic)) orelse
+        wasmInvariantFmt("WASM/codegen invariant violated: slot release for layout {d} has no registered adapter", .{@backingInt(helper.layout_idx)});
+    return adapter.table_idx;
+}
+
+/// Emit each slot-release adapter's body: its RC helper called on the slot
+/// with the runtime's ops, ignoring the record.
+fn compileSlotDropAdapters(self: *Self) Allocator.Error!void {
+    var roots: std.ArrayList(u64) = .empty;
+    defer roots.deinit(self.allocator);
+    for (self.slot_drop_adapters.keys(), self.slot_drop_adapters.values()) |cache_key, adapter| {
+        if (!adapter.compiled) try roots.append(self.allocator, cache_key);
+    }
+    if (roots.items.len == 0) return;
+    try self.generateHelperBodies(roots.items);
+    for (self.slot_drop_adapters.values()) |*adapter| {
+        if (adapter.compiled) continue;
+        adapter.compiled = true;
+        const helper_func = try self.compileBuiltinInternalRcHelper(adapter.helper, .atomic);
+        const saved = self.saveState() catch return error.OutOfMemory;
+        errdefer self.abandonState(saved);
+        try self.beginFunction(adapter.defined.local);
+        self.stack_frame_size = 0;
+        self.uses_stack_memory = false;
+        self.fp_local = 0;
+        self.cf_depth = 0;
+        self.in_proc = false;
+        self.current_proc_id = null;
+        const slot, _, const ops = try self.allocAnonymousLocals(.i32, 3);
+        try self.emitLocalGet(slot);
+        try self.emitLocalGet(ops);
+        try self.emitCall(helper_func);
+        self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+        try self.encodeLocalsDecl(&self.currentBody().preamble, 3);
+        self.endFunction();
+        self.restoreState(saved);
+    }
+    self.assertHelperBodiesCommitted();
 }
 
 /// Procedure and RC helper bodies a wave generates at once.
@@ -8321,9 +8494,30 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
     self.operation_scratch_cursor = 0;
     defer self.operation_scratch_cursor = null;
     switch (stmt) {
-        // Milestone 1 implements suspension on the interpreter only
-        // (design.md "What Implements It First").
-        .suspend_save, .suspend_return => @panic("TODO: the wasm backend does not implement suspension yet"),
+        // design.md "Backends": the record is a heap-packed erased callable
+        // of the resume entry over the saved values, and the task's list
+        // takes its reference.
+        .suspend_save => |save_stmt| {
+            try self.generateSuspendSave(save_stmt.task, self.store.stmtRow(save_stmt.data));
+            try work.append(wa, .{ .node = .{ .stmt_id = save_stmt.next, .stop = stop } });
+        },
+        // Leave without writing a result: a value result is zero, which
+        // a caller may copy an aggregate from before it tests `task_ready`
+        // (design.md "Backends"). The exit goes through the ret block, so
+        // the epilogue still restores the stack and releases the carry.
+        .suspend_return => {
+            if (builtin.mode == .debug) {
+                const abi = self.store.getProcSpec(self.current_proc_id.?).abi;
+                if (abi == .erased_callable or abi == .erased_record) {
+                    base.invariant("WasmCodeGen invariant violated: suspend_return in an erased-ABI procedure, which stores its result after its body", .{});
+                }
+            }
+            if (self.currentDynResult() == null) {
+                try self.emitZeroValue(self.proc_return.val_type);
+                try self.emitProcReturnSet();
+            }
+            try self.emitExitToDepth(ret_block_depth);
+        },
         .dyn => |dyn_stmt| {
             try self.generateDyn(dyn_stmt.target, self.store.stmtRow(dyn_stmt.data));
             try work.append(wa, .{ .node = .{ .stmt_id = dyn_stmt.next, .stop = stop } });
@@ -8388,8 +8582,8 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
             const assign = self.store.stmtRow(assign_stmt.data);
             try self.generatePackedErasedFn(.{
                 .proc = assign.proc,
-                .capture = assign.capture,
-                .target_layout = self.procLocalLayoutIdx(assign_stmt.target),
+                .capture = if (assign.capture) |capture| PackedCapture{ .local = capture } else .none,
+                .target_layout = @as(?layout.Idx, self.procLocalLayoutIdx(assign_stmt.target)),
                 .capture_layout = assign.capture_layout,
                 .on_drop = assign.on_drop,
                 .on_copy = assign.on_copy,
@@ -10418,17 +10612,59 @@ fn dynTargetAddressLocal(t: DynTarget) ?u32 {
     };
 }
 
+/// Pack `save`'s record, the resume entry over the struct of saved values,
+/// on the heap and push it onto `task`'s list with its slot release.
+fn generateSuspendSave(self: *Self, task: ProcLocalId, save: LIR.SuspendSaveData) Allocator.Error!void {
+    self.requireBuiltinCalls("suspend_save");
+    const capture_size = try self.layoutStorageByteSize(save.capture_layout);
+    var capture: PackedCapture = .none;
+    if (capture_size > 0) {
+        if (builtin.mode == .debug and self.getLayoutStore().getLayout(self.runtimeRepresentationLayoutIdx(save.capture_layout)).tag != .struct_) {
+            base.invariant("WasmCodeGen invariant violated: suspend_save capture layout {d} is not a struct", .{@backingInt(save.capture_layout)});
+        }
+        try self.generateStruct(.{ .fields = save.saved, .struct_layout = save.capture_layout }, null);
+        capture = .{ .built = try self.emitSetNewLocal(.i32) };
+    }
+    try self.generatePackedErasedFn(.{
+        .proc = save.proc,
+        .capture = capture,
+        .target_layout = @as(?layout.Idx, null),
+        .capture_layout = if (capture_size == 0) null else @as(?layout.Idx, save.capture_layout),
+        .on_drop = save.on_drop,
+        .on_copy = LIR.ErasedCallableOnDrop.none,
+        .reuse = @as(?ProcLocalId, null),
+        .reuse_unique = false,
+        .frame = false,
+    });
+    const record = try self.emitSetNewLocal(.i32);
+    try self.emitProcLocal(task);
+    try self.emitLocalGet(record);
+    try self.emitOptionalFunctionTableIndexConst(self.slotDropTableIndex(save.slot_drop));
+    try self.emitBuiltinCall(.task_push_record);
+}
+
+/// Where a packed erased callable's capture comes from: a local, or a value
+/// already built into a wasm local, as a `suspend_save` record's struct of
+/// saved values is.
+const PackedCapture = union(enum) {
+    none,
+    local: ProcLocalId,
+    built: u32,
+};
+
+/// Pack an erased callable. `c.target_layout` is the target local's layout,
+/// or null for a `suspend_save` record, which has no target.
 fn generatePackedErasedFn(self: *Self, c: anytype) Allocator.Error!void {
-    if (builtin.mode == .debug) {
-        const target_layout_val = self.getLayoutStore().getLayout(c.target_layout);
+    if (builtin.mode == .debug) if (c.target_layout) |target_layout| {
+        const target_layout_val = self.getLayoutStore().getLayout(target_layout);
         if (target_layout_val.tag != .erased_callable) {
             base.invariant(
                 "WasmCodeGen invariant violated: packed erased fn target layout {d} is not erased_callable",
-                .{@backingInt(c.target_layout)},
+                .{@backingInt(target_layout)},
             );
         }
-    }
-    if (builtin.mode == .debug and (c.capture != null) != (c.capture_layout != null)) {
+    };
+    if (builtin.mode == .debug and (c.capture != .none) != (c.capture_layout != null)) {
         base.invariant("WasmCodeGen invariant violated: packed erased fn capture value/layout presence differed", .{});
     }
 
@@ -10525,10 +10761,14 @@ fn generatePackedErasedFn(self: *Self, c: anytype) Allocator.Error!void {
     try self.emitI32Const(@intCast(capture_size));
     try self.emitStoreOpSized(.i32, 4, 12);
 
-    if (c.capture) |capture| {
+    if (c.capture != .none) {
         const capture_layout = c.capture_layout orelse unreachable; // capture and capture_layout are present together (asserted at function entry)
         if (capture_size > 0) {
-            const capture_value = try self.emitProcLocalToNewLocal(capture, try self.procLocalValType(capture));
+            const capture_value = switch (c.capture) {
+                .none => unreachable, // this branch runs only for a present capture
+                .local => |capture| try self.emitProcLocalToNewLocal(capture, try self.procLocalValType(capture)),
+                .built => |value_local| value_local,
+            };
 
             if (try self.isCompositeLayout(capture_layout)) {
                 try self.emitMemCopy(payload_ptr, @intCast(wasm_erased_callable_capture_offset), capture_value, @intCast(capture_size));
@@ -13107,7 +13347,30 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 }
             }
         },
-        .task_ready, .task_set_pending, .task_hosted_slot, .task_result_buffer, .task_create => @panic("TODO: task operations are not implemented in the wasm backend"),
+        // The task's three reachable fields sit at the offsets task.zig
+        // names (design.md "Backends").
+        .task_ready => {
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            try self.emitLoadOpSized(.i32, 1, task_field_offsets.pending);
+            self.currentCode().append(self.allocator, Op.i32_eqz) catch return error.OutOfMemory;
+        },
+        .task_set_pending => {
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            try self.emitI32Const(1);
+            try self.emitStoreOpSized(.i32, 1, task_field_offsets.pending);
+            try self.emitI32Const(0);
+        },
+        .task_hosted_slot, .task_result_buffer => {
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            try self.emitLoadOp(.i32, if (ll.op == .task_hosted_slot) task_field_offsets.hosted_slot else task_field_offsets.result_buffer);
+        },
+        .task_create => {
+            // (start, root_result, slot size, slot alignment, buffer size,
+            // buffer alignment), passed to the builtin in order.
+            self.requireBuiltinCalls("task_create");
+            for (0..6) |i| try self.emitProcLocal(GuardedList.at(args, i));
+            try self.emitBuiltinCall(.task_create);
+        },
         .ptr_cast => {
             // ptr_cast: identity bits—both sides are i32 pointers.
             try self.emitProcLocal(GuardedList.at(args, 0));

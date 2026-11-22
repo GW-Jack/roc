@@ -33,14 +33,20 @@ pub const Fixture = struct {
     runtime_env: RuntimeHostEnv,
     locals: std.ArrayList(LocalId) = .empty,
 
-    /// An empty program.
+    /// An empty program for this process's pointer width.
     pub fn init(allocator: Allocator) TaskOpsTestError!Fixture {
+        return initFor(allocator, base.target.TargetUsize.native);
+    }
+
+    /// An empty program whose layouts are for a target with `target_usize`
+    /// pointers, such as wasm32's.
+    pub fn initFor(allocator: Allocator, target_usize: base.target.TargetUsize) TaskOpsTestError!Fixture {
         var store = LirStore.init(allocator);
         errdefer store.deinit();
         return .{
             .allocator = allocator,
             .store = store,
-            .layouts = try layout.Store.init(allocator, base.target.TargetUsize.native),
+            .layouts = try layout.Store.init(allocator, target_usize),
             .runtime_env = RuntimeHostEnv.init(allocator),
         };
     }
@@ -230,6 +236,107 @@ pub fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTes
     return roots[0];
 }
 
+/// A program whose task pauses twice at the suspending hosted call `h` of a
+/// `U64` result, after the continuation pass: the provides root
+/// `g(x) = t = h(x); u = h(t); ret u + x`. Its second pause is inside the
+/// resume entry of the first. Returns the task entry that takes `g`'s place
+/// among the roots.
+pub fn pausingTwiceProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    const allocator = f.allocator;
+    const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const h = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{h_arg}),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_pause"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const x = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const t = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const u = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const r = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const second = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = u,
+        .proc = h,
+        .args = try f.store.addLocalSpan(&.{t}),
+        .next = try f.op(r, .num_int_add_wrap, &.{ u, x }, try f.ret(r)),
+    } }, .test_fixture);
+    const first = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = t,
+        .proc = h,
+        .args = try f.store.addLocalSpan(&.{x}),
+        .next = second,
+    } }, .test_fixture);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{x}),
+        .frame_locals = try f.store.addLocalSpan(&.{ x, t, u, r }),
+        .body = .some(first),
+        .ret_layout = .u64,
+    }, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    return roots[0];
+}
+
+/// A program whose task pauses inside a procedure it calls, after the
+/// continuation pass: the provides root `g(x) = t = k(x); ret t + x` over
+/// `k(y) = s = h(y); ret s`, with `h` the suspending hosted call of a `U64`
+/// result. A hosted site is never a tail site, so `k` saves its record at
+/// `h`, and `g`'s call of `k` is a procedure site: `g` tests `task_ready`
+/// after `k` returns and saves its own record when `k` paused. Returns the
+/// task entry that takes `g`'s place among the roots.
+pub fn pausingNestedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    const allocator = f.allocator;
+    const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const h = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{h_arg}),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_pause"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const y = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const s = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const k = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{y}),
+        .frame_locals = try f.store.addLocalSpan(&.{ y, s }),
+        .body = .some(try f.store.addCFStmt(.{ .assign_call = .{
+            .target = s,
+            .proc = h,
+            .args = try f.store.addLocalSpan(&.{y}),
+            .next = try f.ret(s),
+        } }, .test_fixture)),
+        .ret_layout = .u64,
+    }, .none);
+    const x = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const t = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const r = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{x}),
+        .frame_locals = try f.store.addLocalSpan(&.{ x, t, r }),
+        .body = .some(try f.store.addCFStmt(.{ .assign_call = .{
+            .target = t,
+            .proc = k,
+            .args = try f.store.addLocalSpan(&.{x}),
+            .next = try f.op(r, .num_int_add_wrap, &.{ t, x }, try f.ret(r)),
+        } }, .test_fixture)),
+        .ret_layout = .u64,
+    }, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    return roots[0];
+}
+
 /// An interpreter for `f`'s program whose hosted calls go to `host`, kept
 /// alive while its records are.
 const PausingRun = struct {
@@ -288,6 +395,32 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
     try std.testing.expectEqual(@as(u32, 1), host.calls);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "a task paused inside a called procedure resumes in its caller's continuation" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try pausingNestedProgram(&f);
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(entry, @ptrCast(&root));
+
+    // k saves its record at the hosted call; g sees the pending flag after
+    // k returns and saves its own record.
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    try std.testing.expectEqual(@as(u64, 20), host.x);
+    try std.testing.expectEqual(@as(usize, 2), task.len);
+
+    @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
+    task.wake();
+    try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 42), root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }

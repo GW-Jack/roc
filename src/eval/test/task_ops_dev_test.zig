@@ -130,6 +130,32 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     try f.runtime_env.checkForLeaks();
 }
 
+test "a task paused inside a called procedure resumes in its caller's continuation on the dev backend" {
+    if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try lir_test.pausingNestedProgram(&f);
+    var run: DevRun = undefined;
+    try run.init(&f, entry);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = run.start(@ptrCast(&root));
+    const host = &PausingHost.seen;
+
+    // k saves its record at the hosted call; g reads the pending flag with
+    // task_ready after k returns and saves its own record.
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 20), host.x);
+    try std.testing.expectEqual(@as(usize, 2), task.len);
+    @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
+    task.wake();
+    try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 42), root);
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
 test "cancelling a woken task releases the hosted result in its slot and its records on the dev backend" {
     if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
     var f = try Fixture.init(std.testing.allocator);

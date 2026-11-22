@@ -525,6 +525,20 @@ pub fn runWasmAt(allocator: Allocator, program: Program, cpu_level: roc_target.C
     };
 }
 
+/// The wasm32 objects the evaluator's wasm modules merge.
+pub const WasmRuntimeObjects = struct {
+    builtins: []const u8,
+    boxy_runtime: []const u8,
+};
+
+/// The builtins and Boxy runtime objects built for `cpu_level`.
+pub fn wasmRuntimeObjects(cpu_level: roc_target.CpuLevel) WasmRuntimeObjects {
+    return switch (cpu_level) {
+        .default => .{ .builtins = wasm32_builtins.bytes, .boxy_runtime = wasm32_builtins.boxy_runtime_bytes },
+        .v1 => .{ .builtins = wasm32v1_builtins.bytes, .boxy_runtime = wasm32v1_builtins.boxy_runtime_bytes },
+    };
+}
+
 /// Generate the wasm module `runWasmAt` runs, with builtins built for
 /// `cpu_level`. The caller owns the returned bytes.
 pub fn generateWasmModule(allocator: Allocator, program: Program, cpu_level: roc_target.CpuLevel) WasmError!backend.wasm.WasmCodeGen.GenerateResult {
@@ -545,15 +559,8 @@ pub fn generateWasmModule(allocator: Allocator, program: Program, cpu_level: roc
     };
 
     const proc = program.store.getProcSpec(program.main_proc);
-    const builtins_object = switch (cpu_level) {
-        .default => wasm32_builtins.bytes,
-        .v1 => wasm32v1_builtins.bytes,
-    };
-    const boxy_runtime_object = switch (cpu_level) {
-        .default => wasm32_builtins.boxy_runtime_bytes,
-        .v1 => wasm32v1_builtins.boxy_runtime_bytes,
-    };
-    return codegen.generateModule(program.main_proc, proc.ret_layout, builtins_object, boxy_runtime_object) catch |err| switch (err) {
+    const objects = wasmRuntimeObjects(cpu_level);
+    return codegen.generateModule(program.main_proc, proc.ret_layout, objects.builtins, objects.boxy_runtime) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HostedFunctionTypeMismatch => return error.Internal,
     };

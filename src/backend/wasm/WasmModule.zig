@@ -2426,8 +2426,11 @@ pub fn materializeFuncBodies(self: *Self) Allocator.Error!void {
 /// Verify that no stale builtin roc_* imports remain in the final module.
 /// `roc_panic` is also tolerated because current host platforms still import it
 /// behind the `roc_crashed` wrapper, and verification runs before DCE.
-pub fn verifyNoBuiltinImports(self: *const Self) error{UnresolvedBuiltinImport}!void {
-    for (self.imports.items) |imp| {
+/// `hosted` names the platform's hosted functions the module imports, which
+/// may share the prefix.
+pub fn verifyNoBuiltinImports(self: *const Self, hosted: []const []const u8) error{UnresolvedBuiltinImport}!void {
+    imports: for (self.imports.items) |imp| {
+        for (hosted) |name| if (std.mem.eql(u8, imp.field_name, name)) continue :imports;
         if (!isAllowedBuiltinImport(imp.field_name) and std.mem.startsWith(u8, imp.field_name, "roc_")) {
             return error.UnresolvedBuiltinImport;
         }
@@ -6538,7 +6541,7 @@ test "verifyNoBuiltinImports—passes when only RocOps imports remain" {
     _ = try module.addImport("env", shim_symbols.roc_expect_failed, 0);
     _ = try module.addImport("env", shim_symbols.roc_crashed, 0);
 
-    try module.verifyNoBuiltinImports();
+    try module.verifyNoBuiltinImports(&.{});
 }
 
 test "verifyNoBuiltinImports—fails if roc_str_trim import still present" {
@@ -6550,7 +6553,7 @@ test "verifyNoBuiltinImports—fails if roc_str_trim import still present" {
     _ = try module.addImport("env", shim_symbols.roc_alloc, 0);
     _ = try module.addImport("env", "roc_str_trim", 0); // stale builtin import
 
-    const result = module.verifyNoBuiltinImports();
+    const result = module.verifyNoBuiltinImports(&.{});
     try std.testing.expectError(error.UnresolvedBuiltinImport, result);
 }
 
@@ -6563,7 +6566,19 @@ test "verifyNoBuiltinImports—allows non-roc imports" {
     _ = try module.addImport("env", shim_symbols.roc_alloc, 0);
     _ = try module.addImport("env", "custom_platform_fn", 0); // non-roc import is fine
 
-    try module.verifyNoBuiltinImports();
+    try module.verifyNoBuiltinImports(&.{});
+}
+
+test "verifyNoBuiltinImports—allows the platform's hosted imports" {
+    const allocator = std.testing.allocator;
+    var module = Self.init(allocator);
+    defer module.deinit();
+
+    _ = try module.addFuncType(&.{ .i32, .i32 }, &.{});
+    _ = try module.addImport("env", "roc_host_fetch", 0);
+
+    try module.verifyNoBuiltinImports(&.{"roc_host_fetch"});
+    try std.testing.expectError(error.UnresolvedBuiltinImport, module.verifyNoBuiltinImports(&.{}));
 }
 
 test "verifyNoBuiltinImports—allows roc_panic platform import" {
@@ -6574,7 +6589,7 @@ test "verifyNoBuiltinImports—allows roc_panic platform import" {
     _ = try module.addFuncType(&.{ .i32, .i32 }, &.{});
     _ = try module.addImport("env", "roc_panic", 0);
 
-    try module.verifyNoBuiltinImports();
+    try module.verifyNoBuiltinImports(&.{});
 }
 
 test "sealRocObject keeps only provides global and localizes compiler support" {

@@ -96,6 +96,8 @@ const WasmRunState = struct {
     /// them.
     owned_end: u32,
     allocation_count: u32 = 0,
+    /// Allocations not yet freed; `Session` reads it for leak checks.
+    live_allocations: i64 = 0,
     crashed: bool = false,
     crash_message: ?[]u8 = null,
     crash_message_oom: bool = false,
@@ -171,7 +173,7 @@ pub fn runWasmOutcomeWithStats(
 
     var arena_impl = collections.SingleThreadArena.init(allocator);
     defer arena_impl.deinit();
-    var instance = try instantiate(allocator, arena_impl.allocator(), wasm_bytes, has_imports, &run_state);
+    var instance = try instantiate(allocator, arena_impl.allocator(), wasm_bytes, has_imports, &run_state, &.{});
     defer instance.destroy();
     const returned = try instance.invokeMain(&run_state) orelse return crashedWasmResult(&run_state);
 
@@ -213,7 +215,7 @@ pub fn runWasmRaw(
 
     var arena_impl = collections.SingleThreadArena.init(allocator);
     defer arena_impl.deinit();
-    var instance = try instantiate(allocator, arena_impl.allocator(), wasm_bytes, has_imports, &run_state);
+    var instance = try instantiate(allocator, arena_impl.allocator(), wasm_bytes, has_imports, &run_state, &.{});
     defer instance.destroy();
     const returned = try instance.invokeMain(&run_state) orelse {
         if (std.debug.runtime_safety) {
@@ -289,15 +291,21 @@ const Instance = struct {
 
     /// Call `main`; null when the run crashed through the host.
     fn invokeMain(self: *Instance, run_state: *WasmRunState) WasmOutcomeError!?bytebox.Val {
-        const handle = self.module_instance.getFunctionHandle("main") catch |err| {
+        var returns: [1]bytebox.Val = undefined;
+        if (!try self.invoke("main", &.{}, &returns, run_state)) return null;
+        return returns[0];
+    }
+
+    /// Call the export `name`; false when the call crashed through the host.
+    fn invoke(self: *Instance, name: []const u8, params: []const bytebox.Val, returns: []bytebox.Val, run_state: *WasmRunState) WasmOutcomeError!bool {
+        const handle = self.module_instance.getFunctionHandle(name) catch |err| {
             if (std.debug.runtime_safety) {
-                debugPrint("wasm get main handle failed: {s}\n", .{@errorName(err)});
+                debugPrint("wasm get {s} handle failed: {s}\n", .{ name, @errorName(err) });
             }
             return error.WasmExecFailed;
         };
-        var returns: [1]bytebox.Val = undefined;
-        self.module_instance.invoke(handle, &.{}, &returns, .{}) catch |err| {
-            if (run_state.crashed) return null;
+        self.module_instance.invoke(handle, params.ptr, returns.ptr, .{}) catch |err| {
+            if (run_state.crashed) return false;
             if (std.debug.runtime_safety) {
                 debugPrint("wasm invoke failed: {s}\n", .{@errorName(err)});
             }
@@ -320,8 +328,81 @@ const Instance = struct {
             }
             return error.WasmExecFailed;
         };
-        if (run_state.crashed) return null;
-        return returns[0];
+        return !run_state.crashed;
+    }
+};
+
+/// The bytebox types a `Session`'s caller passes and receives.
+pub const Val = bytebox.Val;
+pub const ValType = bytebox.ValType;
+pub const ModuleInstance = bytebox.ModuleInstance;
+
+/// The type of a host function bytebox calls for an import.
+pub const HostCallback = *const fn (?*anyopaque, *bytebox.ModuleInstance, [*]const bytebox.Val, [*]bytebox.Val) error{}!void;
+
+/// A function a `Session` adds to the module's `env` imports, beside the
+/// evaluator's runtime functions: a platform's hosted function, for one.
+pub const HostFunction = struct {
+    name: []const u8,
+    params: []const bytebox.ValType,
+    results: []const bytebox.ValType,
+    callback: HostCallback,
+    context: ?*anyopaque,
+};
+
+/// An instantiated module its caller drives export by export, as a platform
+/// host drives a program: with the evaluator's runtime imports and the
+/// caller's own, its linear memory, and a count of the allocations not yet
+/// freed. It is pinned once initialized: the host functions hold a pointer
+/// to its state.
+pub const Session = struct {
+    run_state: WasmRunState,
+    arena_impl: collections.SingleThreadArena,
+    instance: Instance,
+
+    pub fn init(self: *Session, allocator: std.mem.Allocator, wasm_bytes: []const u8, heap_base: u32, extra: []const HostFunction) WasmOutcomeError!void {
+        self.run_state = WasmRunState.init(allocator, heap_base);
+        errdefer self.run_state.deinit();
+        self.arena_impl = collections.SingleThreadArena.init(allocator);
+        errdefer self.arena_impl.deinit();
+        self.instance = try instantiate(allocator, self.arena_impl.allocator(), wasm_bytes, true, &self.run_state, extra);
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.instance.destroy();
+        self.arena_impl.deinit();
+        self.run_state.deinit();
+    }
+
+    /// Call the export `name`. A Roc crash is an error.
+    pub fn invoke(self: *Session, name: []const u8, params: []const bytebox.Val, returns: []bytebox.Val) WasmOutcomeError!void {
+        if (!try self.instance.invoke(name, params, returns, &self.run_state)) {
+            if (std.debug.runtime_safety) {
+                if (self.run_state.crash_message) |message| debugPrint("wasm run crashed: {s}\n", .{message});
+            }
+            return error.WasmExecFailed;
+        }
+    }
+
+    pub fn memory(self: *Session) []u8 {
+        return self.instance.memoryAll();
+    }
+
+    /// `length` bytes of linear memory the host owns, as `roc_alloc` gives
+    /// them; it counts as live until `free`.
+    pub fn alloc(self: *Session, alignment: u32, length: u32) u32 {
+        self.run_state.live_allocations += 1;
+        return allocWasmData(&self.run_state, self.instance.module_instance, alignment, length);
+    }
+
+    /// Release what `alloc` gave.
+    pub fn free(self: *Session) void {
+        self.run_state.live_allocations -= 1;
+    }
+
+    /// Allocations, the program's and the host's, not yet freed.
+    pub fn liveAllocations(self: *const Session) i64 {
+        return self.run_state.live_allocations;
     }
 };
 
@@ -332,6 +413,7 @@ fn instantiate(
     wasm_bytes: []const u8,
     has_imports: bool,
     run_state: *WasmRunState,
+    extra: []const HostFunction,
 ) WasmOutcomeError!Instance {
     if (wasm_bytes.len == 0) return error.WasmExecFailed;
 
@@ -360,11 +442,14 @@ fn instantiate(
         env_imports.addHostFunction("__muloti4", &[_]bytebox.ValType{ .I32, .I64, .I64, .I64, .I64, .I32 }, &[_]bytebox.ValType{}, hostMuloti4, null) catch return error.WasmExecFailed;
 
         env_imports.addHostFunction(builtins.shim_symbols.roc_alloc, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{.I32}, hostRocAlloc, run_state) catch return error.WasmExecFailed;
-        env_imports.addHostFunction(builtins.shim_symbols.roc_dealloc, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{}, hostRocDealloc, null) catch return error.WasmExecFailed;
+        env_imports.addHostFunction(builtins.shim_symbols.roc_dealloc, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{}, hostRocDealloc, run_state) catch return error.WasmExecFailed;
         env_imports.addHostFunction(builtins.shim_symbols.roc_realloc, &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{.I32}, hostRocRealloc, run_state) catch return error.WasmExecFailed;
         env_imports.addHostFunction(builtins.shim_symbols.roc_dbg, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{}, hostRocDbg, run_state) catch return error.WasmExecFailed;
         env_imports.addHostFunction(builtins.shim_symbols.roc_expect_failed, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{}, hostRocExpectFailed, run_state) catch return error.WasmExecFailed;
         env_imports.addHostFunction(builtins.shim_symbols.roc_crashed, &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{}, hostRocCrashed, run_state) catch return error.WasmExecFailed;
+        for (extra) |function| {
+            env_imports.addHostFunction(function.name, function.params, function.results, function.callback, function.context) catch return error.WasmExecFailed;
+        }
 
         const imports = [_]bytebox.ModuleImportPackage{env_imports};
         module_instance.instantiate(.{ .stack_size = 1024 * 256, .imports = &imports }) catch |err| {
@@ -426,11 +511,15 @@ fn hostRocAlloc(ctx: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]co
     const state: *WasmRunState = @ptrCast(@alignCast(ctx));
     const length: u32 = @bitCast(params[0].I32);
     const alignment: u32 = @bitCast(params[1].I32);
+    state.live_allocations += 1;
     const data_ptr = allocWasmData(state, module, alignment, length);
     results[0] = .{ .I32 = @bitCast(data_ptr) };
 }
 
-fn hostRocDealloc(_: ?*anyopaque, _: *bytebox.ModuleInstance, _: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {}
+fn hostRocDealloc(ctx: ?*anyopaque, _: *bytebox.ModuleInstance, _: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const state: *WasmRunState = @ptrCast(@alignCast(ctx));
+    state.live_allocations -= 1;
+}
 
 fn hostRocRealloc(ctx: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const state: *WasmRunState = @ptrCast(@alignCast(ctx));
