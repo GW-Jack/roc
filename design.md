@@ -34012,7 +34012,11 @@ resolving the fixture's hosted symbols to that host, and its result,
 hosted-call trace and leak check match the interpreter's, including a
 cancel at each pause. The CLI stops rejecting `concurrency: Tasks` for that
 backend in the same change. The dev backend and LLVM come first, then
-wasm.
+wasm. The wasm runner is bytebox, and its host keeps the strings it passes
+and receives in the module's memory. A wasm host can cancel a task only
+through `roc_task_cancel`, which comes with the host ABI (Host Contract), so
+until then wasm's end-to-end runs pause and finish but do not cancel, and
+the CLI still rejects a wasm target.
 
 ### What Implements It First
 

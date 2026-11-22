@@ -150,7 +150,8 @@ pub const DevError = Allocator.Error || error{
     FlushInstructionCacheFailed,
 };
 
-const WasmError = Allocator.Error || error{
+/// Why generating or running a program's wasm module fails.
+pub const WasmError = Allocator.Error || error{
     Internal,
     WasmExecFailed,
 };
@@ -542,21 +543,10 @@ pub fn wasmRuntimeObjects(cpu_level: roc_target.CpuLevel) WasmRuntimeObjects {
 /// Generate the wasm module `runWasmAt` runs, with builtins built for
 /// `cpu_level`. The caller owns the returned bytes.
 pub fn generateWasmModule(allocator: Allocator, program: Program, cpu_level: roc_target.CpuLevel) WasmError!backend.wasm.WasmCodeGen.GenerateResult {
-    var codegen = backend.wasm.WasmCodeGen.init(
-        allocator,
-        program.store,
-        program.layouts,
-        cpu_level,
-    );
+    var codegen = backend.wasm.WasmCodeGen.init(allocator, program.store, program.layouts, cpu_level);
     defer codegen.deinit();
-    codegen.executor = program.post_check_executor;
-    const helpers = try backend.collectRequiredRcHelpers(allocator, program.static_data);
+    const helpers = try prepareWasmCodeGen(allocator, &codegen, program);
     defer allocator.free(helpers);
-    codegen.static_data_rc_helpers = helpers;
-    codegen.module.addStaticDataExports(program.static_data) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Internal,
-    };
 
     const proc = program.store.getProcSpec(program.main_proc);
     const objects = wasmRuntimeObjects(cpu_level);
@@ -564,6 +554,45 @@ pub fn generateWasmModule(allocator: Allocator, program: Program, cpu_level: roc
         error.OutOfMemory => return error.OutOfMemory,
         error.HostedFunctionTypeMismatch => return error.Internal,
     };
+}
+
+/// Generate a final wasm module, with builtins built for `cpu_level`, that
+/// exports `entrypoints` by their symbol names and the merged builtins'
+/// `runtime_exports` by theirs, as a host drives a program through its own
+/// exports (a task's `roc_task_resume`, for one). `program.main_proc` is
+/// not used. The caller owns the returned bytes.
+pub fn generateWasmEntrypointModule(
+    allocator: Allocator,
+    program: Program,
+    entrypoints: []const backend.wasm.WasmCodeGen.ModuleEntrypoint,
+    runtime_exports: []const []const u8,
+    cpu_level: roc_target.CpuLevel,
+) WasmError!backend.wasm.WasmCodeGen.EntrypointModule {
+    var codegen = backend.wasm.WasmCodeGen.init(allocator, program.store, program.layouts, cpu_level);
+    defer codegen.deinit();
+    const helpers = try prepareWasmCodeGen(allocator, &codegen, program);
+    defer allocator.free(helpers);
+
+    const objects = wasmRuntimeObjects(cpu_level);
+    return codegen.generateEntrypointModule(entrypoints, runtime_exports, objects.builtins, objects.boxy_runtime) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.HostedFunctionTypeMismatch => return error.Internal,
+    };
+}
+
+/// Give `codegen` the program's executor and static data, and return the
+/// RC helpers that static data needs, which `codegen` reads until it is
+/// done; the caller frees them.
+fn prepareWasmCodeGen(allocator: Allocator, codegen: *backend.wasm.WasmCodeGen, program: Program) WasmError![]const layout.RcHelperKey {
+    codegen.executor = program.post_check_executor;
+    const helpers = try backend.collectRequiredRcHelpers(allocator, program.static_data);
+    errdefer allocator.free(helpers);
+    codegen.static_data_rc_helpers = helpers;
+    codegen.module.addStaticDataExports(program.static_data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Internal,
+    };
+    return helpers;
 }
 
 /// LLVM compile options plus the owned strings they point into.
