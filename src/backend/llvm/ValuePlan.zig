@@ -640,6 +640,7 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .task_set_pending,
         .task_hosted_slot,
         .task_result_buffer,
+        .task_create,
         .crash,
         => .{},
     };

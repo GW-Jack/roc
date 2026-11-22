@@ -2353,7 +2353,13 @@ fn finishLoweredOutput(
     // run, and every procedure they reach is already reachable; what they
     // add is reachable by construction (design.md "The Continuation Pass").
     var continuation_scope = PassStepScope.begin(target.timing, .continuation_pass);
-    try ContinuationPass.run(allocator, &lowered.lir_result.store, &lowered.lir_result.layouts);
+    {
+        const result = &lowered.lir_result;
+        const provided = try allocator.alloc(bool, result.root_metadata.items.len);
+        defer allocator.free(provided);
+        for (result.root_metadata.items, provided) |metadata, *is_provided| is_provided.* = metadata.abi == .platform;
+        try ContinuationPass.run(allocator, &result.store, &result.layouts, .{ .procs = result.root_procs.items, .provided = provided });
+    }
     continuation_scope.end();
     // Every erased call names the allocation root its closure's unit belongs
     // to, reached through the representation-transparent aliases of the

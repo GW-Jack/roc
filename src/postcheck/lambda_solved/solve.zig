@@ -3524,6 +3524,7 @@ const Solver = struct {
             .task_set_pending,
             .task_hosted_slot,
             .task_result_buffer,
+            .task_create,
             => Common.invariantFmt("low-level op {s} reached Lambda Solved", .{@tagName(op)}),
             // No value of these flows from an operand into the result, because
             // their results hold no function: numbers, strings, and byte lists,

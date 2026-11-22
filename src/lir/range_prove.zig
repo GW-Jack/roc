@@ -8148,6 +8148,7 @@ const Pass = struct {
             .task_set_pending,
             .task_hosted_slot,
             .task_result_buffer,
+            .task_create,
             .compare,
             .crash,
             => try self.bindFresh(s.target),

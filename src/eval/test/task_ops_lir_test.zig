@@ -187,9 +187,9 @@ const PausingHost = struct {
 };
 
 /// A program whose task pauses at a suspending hosted call `h(x)` with a
-/// result of `hosted_ret`, after the continuation pass:
-/// `g(x) = t = h(x); ret (if add then t + x else x)`, a start procedure
-/// `s(task) = ret g(20, task)`, and `pack() = ret <s>`. Returns `pack`.
+/// result of `hosted_ret`, after the continuation pass: the provides root
+/// `g(x) = t = h(x); ret (if add then t + x else x)`. Returns the task entry
+/// that takes `g`'s place among the roots.
 fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTestError!LIR.LirProcSpecId {
     const allocator = f.allocator;
     const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
@@ -220,59 +220,9 @@ fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTestErr
         .ret_layout = .u64,
     }, .none);
     try lir.SuspensionMarks.run(allocator, &f.store);
-    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts);
-
-    // The start record's procedure, built after the pass: the pass does not
-    // yet give an erased callable a task (design.md "What Implements It
-    // First"), so this one takes it as its explicit argument.
-    const s_task = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
-    const s_capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
-    const s_reuse = try f.store.addLocal(.{ .layout_idx = try f.layouts.insertErasedCallable() });
-    const s_x = try f.store.addLocal(.{ .layout_idx = .u64 });
-    const s_r = try f.store.addLocal(.{ .layout_idx = .u64 });
-    const s_call = try f.store.addCFStmt(.{ .assign_call = .{
-        .target = s_r,
-        .proc = g,
-        .args = try f.store.addLocalSpan(&.{ s_x, s_task }),
-        .next = try f.ret(s_r),
-    } }, .test_fixture);
-    const s_lit = try f.store.addCFStmt(.{ .assign_literal = .{
-        .target = s_x,
-        .value = .{ .i64_literal = .{ .value = 20, .layout_idx = .u64 } },
-        .next = s_call,
-    } }, .test_fixture);
-    const s = try f.store.addProcSpec(.{
-        .name = f.store.freshSyntheticSymbol(),
-        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
-        .args = try f.store.addLocalSpan(&.{ s_task, s_capture, s_reuse }),
-        .frame_locals = try f.store.addLocalSpan(&.{ s_task, s_capture, s_reuse, s_x, s_r }),
-        .body = .some(s_lit),
-        .ret_layout = .u64,
-        .abi = .erased_callable,
-        .erased_capture_arg = .some(s_capture),
-        .erased_reuse_arg = .some(s_reuse),
-        .erased_call_args = .some(try f.store.internErasedCallArgsPlan(&f.layouts, &.{.opaque_ptr})),
-    }, .none);
-
-    const start = try f.store.addLocal(.{ .layout_idx = try f.layouts.insertErasedCallable() });
-    const pack_body = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
-        .target = start,
-        .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
-            .proc = s,
-            .capture = null,
-            .capture_layout = null,
-            .on_drop = .none,
-        }),
-        .next = try f.ret(start),
-    } }, .test_fixture);
-    return try f.store.addProcSpec(.{
-        .name = f.store.freshSyntheticSymbol(),
-        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
-        .args = .empty(),
-        .frame_locals = try f.store.addLocalSpan(&.{start}),
-        .body = .some(pack_body),
-        .ret_layout = try f.layouts.insertErasedCallable(),
-    }, .none);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    return roots[0];
 }
 
 /// An interpreter for `f`'s program whose hosted calls go to `host`, kept
@@ -293,29 +243,30 @@ const PausingRun = struct {
         self.static_strings.deinit();
     }
 
-    /// Pack the start record and make the task, whose root result is `root`.
-    fn start(self: *PausingRun, f: *Fixture, pack: LIR.LirProcSpecId, root: [*]u8, hosted_ret: layout.Idx) TaskOpsTestError!*RocTask {
-        const packed_start = try self.interp.eval(.{ .proc_id = pack });
-        const slot = f.layouts.layoutSizeAlign(f.layouts.getLayout(hosted_ret));
-        return RocTask.create(f.runtime_env.get_ops(), @ptrFromInt(packed_start.value.read(usize)), root, .{
-            .hosted_slot_size = slot.size,
-            .hosted_slot_alignment = slot.alignment.toByteUnits(),
-            .result_buffer_size = 0,
-            .result_buffer_alignment = 1,
+    /// Call the task entry as the host calls a provides entry, with 20 and
+    /// the root result's address, and return the task it creates.
+    fn start(self: *PausingRun, entry: LIR.LirProcSpecId, root: [*]u8) TaskOpsTestError!*RocTask {
+        const Args = extern struct { x: u64, result_out: usize };
+        var args = Args{ .x = 20, .result_out = @intFromPtr(root) };
+        const created = try self.interp.eval(.{
+            .proc_id = entry,
+            .arg_layouts = &.{ .u64, .opaque_ptr },
+            .arg_ptr = @ptrCast(&args),
         });
+        return @ptrFromInt(created.value.read(usize));
     }
 };
 
 test "a task paused at a hosted call resumes from its record and returns the root result" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const pack = try pausingProgram(&f, .u64, true);
+    const entry = try pausingProgram(&f, .u64, true);
     var host = PausingHost{};
     var run: PausingRun = undefined;
     try run.init(&f, &host);
     defer run.deinit();
     var root: u64 = 0;
-    const task = try run.start(&f, pack, @ptrCast(&root), .u64);
+    const task = try run.start(entry, @ptrCast(&root));
 
     // The first run reaches the hosted call, which is pending: the task
     // parks with g's record saved.
@@ -339,13 +290,13 @@ test "a task paused at a hosted call resumes from its record and returns the roo
 test "cancelling a woken task releases the hosted result in its slot and its records" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const pack = try pausingProgram(&f, .str, false);
+    const entry = try pausingProgram(&f, .str, false);
     var host = PausingHost{};
     var run: PausingRun = undefined;
     try run.init(&f, &host);
     defer run.deinit();
     var root: u64 = 0;
-    const task = try run.start(&f, pack, @ptrCast(&root), .str);
+    const task = try run.start(entry, @ptrCast(&root));
     try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
 
     // The host writes a heap string and wakes the task, which is then
@@ -364,13 +315,13 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
 test "cancelling a task the host has not finished aborts the host call and releases its records" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const pack = try pausingProgram(&f, .str, false);
+    const entry = try pausingProgram(&f, .str, false);
     var host = PausingHost{};
     var run: PausingRun = undefined;
     try run.init(&f, &host);
     defer run.deinit();
     var root: u64 = 0;
-    const task = try run.start(&f, pack, @ptrCast(&root), .str);
+    const task = try run.start(entry, @ptrCast(&root));
     try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
 
     aborted = null;

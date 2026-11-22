@@ -1254,17 +1254,19 @@ const cases = [_]Case{
 /// Ops that this source-level sweep cannot reach. Each needs a reason; the
 /// sweep fails when one turns out to be covered after all.
 ///
-/// Every entry here is an op no LIR statement carries: either no name in
+/// Most entries here are ops no LIR statement carries: either no name in
 /// `Builtin.roc` maps to it through `canonicalize/BuiltinLowLevel.zig`, or
 /// lowering replaces it with other statements, and no lowering pass emits it.
 /// They are reachable only from a backend's switch, which is why their rows
 /// have gone unchecked. Wiring one up is what makes its row matter, and doing
-/// that removes it from this table.
+/// that removes it from this table. The rest are emitted only for a program
+/// whose platform this sweep's sources cannot declare.
 const exemptions = [_]Exemption{
     .{ .op = .box_unbox, .reason = "allocation-consuming compiled variant is pinned by focused LIR and runtime-helper tests" },
     .{ .op = .erased_capture_load, .reason = "ARC normalizes the consuming capture load into erased_capture_load_borrowed plus explicit RC statements, which the erased-call alloc-count tests and the certifier pin" },
     .{ .op = .list_prefetched, .reason = "no LIR producer: lowering splits List.prefetched into an alias of its list and list_prefetch" },
     .{ .op = .list_reverse, .reason = "no producer: List.rev is written in Roc over list_get_unsafe" },
+    .{ .op = .task_create, .reason = "only the continuation pass emits it, for a provides root of a platform that declares `concurrency: Tasks`, which this sweep's platform-free sources cannot declare; the task-ops LIR tests and the tasks end-to-end leak checks pin that it takes its start record" },
 };
 
 /// Loaded once and kept for the life of the test binary: publishing the

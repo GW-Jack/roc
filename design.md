@@ -33792,8 +33792,8 @@ the continuation pass records for the runtime:
   before its continuation runs. What it writes there is its result only when
   the task is not pending afterwards.
 
-LIR reaches the task only through four low-level operations on the task
-pointer. Only the continuation pass makes them, and none touches a reference
+LIR reaches the task only through five low-level operations. Only the
+continuation pass makes them, and only `task_create` touches a reference
 count:
 
 - `task_ready(task)` is a `Bool`, true while the task's pending flag is
@@ -33801,7 +33801,10 @@ count:
 - `task_set_pending(task)` sets the flag;
 - `task_hosted_slot(task)` and `task_result_buffer(task)` are the addresses
   of the two buffers, typed by their target's `Ptr` layout and read with
-  `ptr_load`.
+  `ptr_load`;
+- `task_create(start, root_result, sizes...)` is a new task whose list holds
+  the start record, which it takes, with the two buffers' sizes and
+  alignments as `U64` operands.
 
 The runtime's `RocTask` (`src/builtins/task.zig`) fixes where these live.
 The interpreter implements the operations against it. The other backends
@@ -33832,9 +33835,19 @@ runtime reverses them, so the innermost of them is taken next.
 Waking a task records that the host wrote the hosted slot, and clears with
 the next resume.
 
-A root in a `Tasks` build is a task from the start: its `provides` entry creates the task with a start record, an erased callable
-whose capture is the entry's arguments and whose procedure calls the root's
-body with the task. The host's first resume runs it.
+A root in a `Tasks` build is a task from the start. For each `provides`
+root that may suspend, the pass makes a start procedure and a task entry,
+and the entry takes the root's place among the program's roots, so every
+backend wraps it as it wraps any root. The start procedure is an erased
+callable whose capture is the root's arguments and whose body calls the
+root with them and the task, as a tail site. The entry `E(args...,
+result_out)` packs the start record and returns
+`task_create(start, result_out, sizes...)`; the sizes are literals the pass
+computed from the largest hosted result and the largest result of a
+procedure that may suspend. That makes the host's signature the one Host
+Contract shows. The host's first resume runs the start record. A root that
+is not a `provides` entry never suspends, since nothing else reaches a
+`suspending` hosted procedure.
 
 Cancelling a parked task asks the host to abandon the operation it is parked
 on (`roc_task_abort`) and releases its records. If the host had already
@@ -33900,7 +33913,9 @@ interpreter. Until the rest exists:
   platform's `concurrency` mode, so the checked-module cache version moves.
 - LIR gains the `suspends` marks, `suspend_save` and `suspend_return`, and
   LirImage carries them, so the LirImage format version moves.
-- The program records the two buffer sizes for the runtime.
+- The program records the two buffer sizes for the runtime, as the literal
+  operands of each task entry's `task_create`, so no image field holds
+  them.
 - Each change comes with the test that an entry of the previous version is
   rejected.
 

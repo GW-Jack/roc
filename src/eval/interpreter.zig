@@ -6639,6 +6639,20 @@ pub const Interpreter = struct {
             },
             .task_hosted_slot => try self.pointerValue(ll.ret_layout, @intFromPtr(taskOf(self.readPointerInt(args[0])).hosted_slot)),
             .task_result_buffer => try self.pointerValue(ll.ret_layout, @intFromPtr(taskOf(self.readPointerInt(args[0])).result_buffer)),
+            // The task keeps the caller's operations, not this interpreter's
+            // forwarding ones: the host frees the task after its last record,
+            // which may hold the last reference to this interpreter, is gone.
+            .task_create => blk: {
+                const start = self.readBoxedDataPointer(args[0]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: task_create had no start record", .{});
+                const task = RocTask.create(self.roc_env.currentRocOps(), start, @ptrFromInt(self.readPointerInt(args[1])), .{
+                    .hosted_slot_size = @intCast(args[2].read(u64)),
+                    .hosted_slot_alignment = @intCast(args[3].read(u64)),
+                    .result_buffer_size = @intCast(args[4].read(u64)),
+                    .result_buffer_alignment = @intCast(args[5].read(u64)),
+                });
+                break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(task));
+            },
 
             // ── Crash ──
             .crash => return self.triggerCrash("Roc crashed"),

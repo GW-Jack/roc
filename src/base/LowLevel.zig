@@ -685,6 +685,11 @@ pub const LowLevel = enum(u16) {
     task_hosted_slot,
     /// (task) -> Ptr(T): the address of the task's result buffer.
     task_result_buffer,
+    /// (start, root_result, hosted_slot_size, hosted_slot_alignment,
+    /// result_buffer_size, result_buffer_alignment) -> task: a new task whose
+    /// list holds the start record, which it takes, and whose root result
+    /// goes to `root_result`. Each size and alignment is a `U64`.
+    task_create,
 
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
@@ -1281,6 +1286,7 @@ pub const LowLevel = enum(u16) {
         .task_set_pending = byType(.none()),
         .task_hosted_slot = byType(.none()),
         .task_result_buffer = byType(.none()),
+        .task_create = byType(.consumesArgsRetainingArgs(arg_0, 0)),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

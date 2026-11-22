@@ -34,6 +34,33 @@ const ProcId = LIR.LirProcSpecId;
 /// Contract").
 const roc_ready: u64 = 0;
 
+/// The program's roots, parallel to `program.Result.root_procs`. The pass
+/// replaces each `provides` root that may suspend with its task entry
+/// (design.md "Records And The Task").
+pub const Roots = struct {
+    procs: []ProcId,
+    /// Whether each root is a platform `provides` entry. Only those may
+    /// suspend: nothing else reaches a `suspending` hosted procedure.
+    provided: []const bool,
+
+    pub const none: Roots = .{ .procs = &.{}, .provided = &.{} };
+};
+
+/// The sizes and alignments of a task's two buffers, the largest of what
+/// they hold (design.md "Records And The Task").
+const Buffers = struct {
+    hosted_slot_size: u64 = 0,
+    hosted_slot_alignment: u64 = 1,
+    result_buffer_size: u64 = 0,
+    result_buffer_alignment: u64 = 1,
+
+    fn fit(size: *u64, alignment: *u64, layouts: *const layout.Store, layout_idx: layout.Idx) void {
+        const size_align = layouts.layoutSizeAlign(layouts.getLayout(layout_idx));
+        size.* = @max(size.*, size_align.size);
+        alignment.* = @max(alignment.*, size_align.alignment.toByteUnits());
+    }
+};
+
 /// What the pass knows about one site of the procedure that contains it.
 const SiteInfo = struct {
     live_after: []const LocalId,
@@ -57,8 +84,9 @@ const ProcPlan = struct {
 /// Give every procedure that may suspend its task argument, make the
 /// continuation and resume entry of each of its sites that is not a tail
 /// site, add the pending edges, and give `suspending` hosted procedures the
-/// host's shape.
-pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Allocator.Error!void {
+/// host's shape. Each `provides` root that may suspend is started as a task:
+/// its place in `roots` goes to an entry that creates the task.
+pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots: Roots) Allocator.Error!void {
     var plans = std.ArrayList(ProcPlan).empty;
     defer {
         for (plans.items) |*plan| plan.sites.deinit();
@@ -172,22 +200,197 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Alloc
         }
     }
 
+    // The hosted slot holds any `suspending` hosted result, read before the
+    // hosted rewrite changes the result to a poll; the result buffer holds
+    // the result of any procedure that may suspend.
+    var buffers = Buffers{};
+    var slot_iter = hosted_procs.iterator(.{});
+    while (slot_iter.next()) |index| {
+        Buffers.fit(&buffers.hosted_slot_size, &buffers.hosted_slot_alignment, layouts, store.getProcSpecImmediate(@fromBackingInt(@intCast(index))).ret_layout);
+    }
+    for (plans.items) |plan| {
+        Buffers.fit(&buffers.result_buffer_size, &buffers.result_buffer_alignment, layouts, store.getProcSpecImmediate(plan.proc).ret_layout);
+    }
+
     var hosted_iter = hosted_procs.iterator(.{});
     while (hosted_iter.next()) |index| try hostShape(store, layouts, @fromBackingInt(@intCast(index)));
+
+    std.debug.assert(roots.procs.len == roots.provided.len);
+    for (roots.procs, roots.provided) |*root, provided| {
+        if (store.getProcSpecImmediate(root.*).suspends == .never) continue;
+        if (!provided) invariant("a root that is not a provides entry may suspend", .{});
+        root.* = try startRoot(allocator, store, layouts, root.*, buffers);
+    }
 
     try SuspensionMarks.run(allocator, store);
     if (builtin.mode == .debug) try verify(allocator, store);
 }
 
 /// Give a procedure the pass derives from `source` its source location and
-/// a debug name that says which of `source`'s sites it belongs to, so dumps
-/// and name-keyed tests tell it from `source`.
-fn nameDerived(allocator: Allocator, store: *LirStore, derived: ProcId, source: ProcId, role: []const u8, ordinal: usize) Allocator.Error!void {
+/// a debug name that says what it is to `source` (and which of `source`'s
+/// sites, for a continuation or resume entry), so dumps and name-keyed tests
+/// tell it from `source`.
+fn nameDerived(allocator: Allocator, store: *LirStore, derived: ProcId, source: ProcId, role: []const u8, ordinal: ?usize) Allocator.Error!void {
     try store.copyProcDebugInfo(derived, source);
     const name = store.procDebugName(source) orelse return;
-    const text = try std.fmt.allocPrint(allocator, "{s}#{s}{d}", .{ name, role, ordinal });
+    const text = if (ordinal) |index|
+        try std.fmt.allocPrint(allocator, "{s}#{s}{d}", .{ name, role, index })
+    else
+        try std.fmt.allocPrint(allocator, "{s}#{s}", .{ name, role });
     defer allocator.free(text);
     try store.setProcDebugName(derived, text);
+}
+
+/// Start the root `root`, which may suspend, as a task. Its start procedure
+/// `S` is an erased callable whose capture is the root's explicit arguments
+/// and whose body calls the root with them and the task, as a tail site. Its
+/// task entry `E(args..., result_out)` takes the root's place: it packs the
+/// start record and returns the task it creates, whose root result goes to
+/// `result_out` (design.md "Host Contract"). Returns `E`.
+fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, buffers: Buffers) Allocator.Error!ProcId {
+    const source = store.getProcSpecImmediate(root).*;
+    const origin = store.stmtOrigin(source.body.get().?);
+    const root_args = try copyLocals(allocator, store, source.args);
+    defer allocator.free(root_args);
+    // The task is the root's last argument; the host passes the others.
+    const explicit = root_args[0 .. root_args.len - 1];
+    const arg_layouts = try allocator.alloc(layout.Idx, explicit.len);
+    defer allocator.free(arg_layouts);
+    const capture_fields = try allocator.alloc(layout.StructField, explicit.len);
+    defer allocator.free(capture_fields);
+    for (explicit, arg_layouts, capture_fields, 0..) |arg, *arg_layout, *field, index| {
+        arg_layout.* = store.getLocal(arg).layout_idx;
+        field.* = .{ .index = @intCast(index), .layout = arg_layout.* };
+    }
+    const capture_layout = try layouts.putStructFields(capture_fields);
+    const erased = try layouts.insertErasedCallable();
+
+    const start = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = source.identity.derived("start", &.{}),
+        .args = .empty(),
+        .ret_layout = source.ret_layout,
+        .abi = .erased_callable,
+    }, store.procLoc(root));
+    try nameDerived(allocator, store, start, root, "start", null);
+    {
+        var frame = std.ArrayList(LocalId).empty;
+        defer frame.deinit(allocator);
+        const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
+        const capture = try freshLocal(store, &frame, allocator, .opaque_ptr);
+        const reuse = try freshLocal(store, &frame, allocator, erased);
+        const value = try freshLocal(store, &frame, allocator, source.ret_layout);
+        const call_args = try allocator.alloc(LocalId, explicit.len + 1);
+        defer allocator.free(call_args);
+        for (arg_layouts, call_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
+        call_args[explicit.len] = task;
+
+        const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+        var head = try store.addCFStmt(.{ .assign_call = .{
+            .target = value,
+            .proc = root,
+            .args = try store.addLocalSpan(call_args),
+            .next = ret,
+        } }, origin);
+        const fields = call_args[0..explicit.len];
+        if (capture_layout == .zst) {
+            // Every argument is zero-sized, so there is no capture to read.
+            var index = fields.len;
+            while (index > 0) {
+                index -= 1;
+                head = try store.addCFStmt(.{ .assign_struct = .{ .target = fields[index], .fields = .empty(), .next = head } }, origin);
+            }
+        } else {
+            const record = try freshLocal(store, &frame, allocator, capture_layout);
+            var index = fields.len;
+            while (index > 0) {
+                index -= 1;
+                head = try store.addCFStmt(.{ .assign_ref = .{ .target = fields[index], .op = LIR.RefOp.field(record, @intCast(index)), .next = head } }, origin);
+            }
+            head = try store.addLowLevelStmt(record, .erased_capture_load, &.{ capture, reuse }, head, origin);
+        }
+        std.mem.sort(LocalId, frame.items, {}, localLessThan);
+        const spec = store.getProcSpecPtr(start);
+        spec.args = try store.addLocalSpan(&.{ task, capture, reuse });
+        spec.frame_locals = try store.addLocalSpan(frame.items);
+        spec.body = .some(head);
+        spec.erased_capture_arg = .some(capture);
+        spec.erased_reuse_arg = .some(reuse);
+        spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
+    }
+
+    const entry = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = source.identity.derived("task-entry", &.{}),
+        .args = .empty(),
+        .ret_layout = .opaque_ptr,
+    }, store.procLoc(root));
+    try nameDerived(allocator, store, entry, root, "entry", null);
+    {
+        var frame = std.ArrayList(LocalId).empty;
+        defer frame.deinit(allocator);
+        const entry_args = try allocator.alloc(LocalId, explicit.len + 1);
+        defer allocator.free(entry_args);
+        for (arg_layouts, entry_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
+        const result_out = try freshLocal(store, &frame, allocator, .opaque_ptr);
+        entry_args[explicit.len] = result_out;
+        const record = try freshLocal(store, &frame, allocator, erased);
+        const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
+        const sizes = [_]u64{ buffers.hosted_slot_size, buffers.hosted_slot_alignment, buffers.result_buffer_size, buffers.result_buffer_alignment };
+        var size_locals: [sizes.len]LocalId = undefined;
+        for (&size_locals) |*size_local| size_local.* = try freshLocal(store, &frame, allocator, .u64);
+
+        const ret = try store.addCFStmt(.{ .ret = .{ .value = task } }, origin);
+        var head = try store.addLowLevelStmt(task, .task_create, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
+        var index = sizes.len;
+        while (index > 0) {
+            index -= 1;
+            head = try store.addCFStmt(.{ .assign_literal = .{
+                .target = size_locals[index],
+                .value = .{ .i64_literal = .{ .value = @intCast(sizes[index]), .layout_idx = .u64 } },
+                .next = head,
+            } }, origin);
+        }
+        const capture: ?LocalId = if (capture_layout == .zst) null else try freshLocal(store, &frame, allocator, capture_layout);
+        head = try store.addCFStmt(.{ .assign_packed_erased_fn = .{
+            .target = record,
+            .data = try store.addStmtRow(LIR.PackedErasedFnData, .{
+                .proc = start,
+                .capture = capture,
+                .capture_layout = if (capture == null) null else capture_layout,
+                .on_drop = if (capture == null) .none else hostDrop(layouts, capture_layout),
+            }),
+            .next = head,
+        } }, origin);
+        if (capture) |capture_local| {
+            head = try store.addCFStmt(.{ .assign_struct = .{
+                .target = capture_local,
+                .fields = try store.addLocalSpan(entry_args[0..explicit.len]),
+                .next = head,
+            } }, origin);
+        }
+        std.mem.sort(LocalId, frame.items, {}, localLessThan);
+        const spec = store.getProcSpecPtr(entry);
+        spec.args = try store.addLocalSpan(entry_args);
+        spec.frame_locals = try store.addLocalSpan(frame.items);
+        spec.body = .some(head);
+    }
+    return entry;
+}
+
+fn freshLocal(store: *LirStore, frame: *std.ArrayList(LocalId), allocator: Allocator, layout_idx: layout.Idx) Allocator.Error!LocalId {
+    const id = try store.addLocal(.{ .layout_idx = layout_idx });
+    try frame.append(allocator, id);
+    return id;
+}
+
+/// The locals of `span`, copied out of the store, which grows as the pass
+/// adds to it.
+fn copyLocals(allocator: Allocator, store: *const LirStore, span: LIR.LocalSpan) Allocator.Error![]LocalId {
+    const list = store.getLocalSpan(span);
+    const out = try allocator.alloc(LocalId, GuardedList.borrowLen(list));
+    for (out, 0..) |*item, index| item.* = GuardedList.at(store.getLocalSpan(span), index);
+    return out;
 }
 
 fn isHosted(store: *const LirStore, proc: ProcId) bool {
@@ -956,7 +1159,7 @@ test "without a procedure that may suspend nothing changes" {
     const ret = try f.stmt(.{ .ret = .{ .value = t } });
     const p = try f.addProc(&.{}, &.{t}, try f.callSeed(t, ret));
     const count = f.store.procSpecCount();
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
     try testing.expectEqual(count, f.store.procSpecCount());
     try testing.expectEqual(@as(usize, 0), f.store.getLocalSpan(f.spec(p).args).len);
 }
@@ -977,7 +1180,7 @@ test "a site's continuation takes its live values and the task and copies the co
     const p = try f.addProc(&.{ x, y }, &.{ x, y, t, s, u }, first);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     // f gains the task after its explicit arguments and passes it at both sites.
     const f_args = try f.locals(f.spec(p).args);
@@ -1035,7 +1238,7 @@ test "a site inside a loop gets a continuation that loops back to its own copy" 
     _ = try f.addProc(&.{acc0}, &.{ acc0, acc, t, s }, join);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     try testing.expectEqual(count + 2, f.store.procSpecCount());
     const c: ProcId = @fromBackingInt(@intCast(count));
@@ -1095,7 +1298,7 @@ test "a procedure site tests the pending flag and saves its resume entry on the 
     const p = try f.addProc(&.{y}, &.{ y, t, s, u }, first);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     const r: ProcId = @fromBackingInt(@intCast(count + 1));
     const f_args = try f.locals(f.spec(p).args);
@@ -1137,7 +1340,7 @@ test "a resume entry reads its capture and the result buffer and calls the conti
     _ = try f.addProc(&.{y}, &.{ y, t, s }, first);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     const c: ProcId = @fromBackingInt(@intCast(count));
     const r: ProcId = @fromBackingInt(@intCast(count + 1));
@@ -1193,7 +1396,7 @@ test "a hosted site reads the slot's address, branches on the poll, and the host
     const p = try f.addProc(&.{x}, &.{ x, t, s }, site);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     const r: ProcId = @fromBackingInt(@intCast(count + 1));
     const f_args = try f.locals(f.spec(p).args);
@@ -1254,7 +1457,7 @@ fn verifyRecordMissingAValue() Allocator.Error!void {
     const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, y }), .next = ret } });
     const first = try f.callSeed(t, build);
     _ = try f.addProc(&.{y}, &.{ y, t, s }, first);
-    try run(testing.allocator, &f.store, &f.layouts);
+    try run(testing.allocator, &f.store, &f.layouts, .none);
 
     const read = f.at(f.at(first).assign_call.next).assign_low_level;
     const edge = f.at(read.next).switch_initialized_payload.uninitialized_branch;
@@ -1263,6 +1466,72 @@ fn verifyRecordMissingAValue() Allocator.Error!void {
     const dropped = try f.store.addStmtRow(LIR.SuspendSaveData, data);
     f.store.getCFStmtPtr(edge).suspend_save.data = dropped;
     try verify(testing.allocator, &f.store);
+}
+
+test "a provides root that may suspend is started as a task by an entry that takes its place" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const y = try f.local();
+    const t = try f.local();
+    // f(y) = t = seed(); ret t, a provides root beside one that never suspends
+    const ret = try f.stmt(.{ .ret = .{ .value = t } });
+    const site = try f.callSeed(t, ret);
+    const p = try f.addProc(&.{y}, &.{ y, t }, site);
+    const z = try f.local();
+    const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
+    const count = f.store.procSpecCount();
+    var roots = [_]ProcId{ p, quiet };
+
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{ true, true } });
+
+    // The root that never suspends keeps its place.
+    try testing.expectEqual(quiet, roots[1]);
+    const start: ProcId = @fromBackingInt(@intCast(count));
+    const entry: ProcId = @fromBackingInt(@intCast(count + 1));
+    try testing.expectEqual(entry, roots[0]);
+
+    // E(y', out) = cap = {y'}; rec = <S cap>; sizes; task = task_create(rec, out, sizes); ret task
+    const entry_args = try f.locals(f.spec(entry).args);
+    defer testing.allocator.free(entry_args);
+    try testing.expectEqual(@as(usize, 2), entry_args.len);
+    try testing.expectEqual(layout.Idx.u64, f.store.getLocal(entry_args[0]).layout_idx);
+    try testing.expectEqual(layout.Idx.opaque_ptr, f.store.getLocal(entry_args[1]).layout_idx);
+    try testing.expectEqual(layout.Idx.opaque_ptr, f.spec(entry).ret_layout);
+    try testing.expectEqual(LIR.Suspends.never, f.spec(entry).suspends);
+    const capture = f.at(f.spec(entry).body.get().?).assign_struct;
+    const pack = f.at(capture.next).assign_packed_erased_fn;
+    try testing.expectEqual(start, f.store.stmtRow(pack.data).proc);
+    try testing.expectEqual(capture.target, f.store.stmtRow(pack.data).capture.?);
+    var cursor = pack.next;
+    var sizes: [4]i64 = undefined;
+    for (&sizes) |*size| {
+        const literal = f.at(cursor).assign_literal;
+        size.* = literal.value.i64_literal.value;
+        cursor = literal.next;
+    }
+    // No hosted procedure: an empty slot. The result buffer fits f's U64.
+    try testing.expectEqualSlices(i64, &.{ 0, 1, 8, 8 }, &sizes);
+    const create = f.at(cursor).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_create, create.op);
+    const create_args = try f.locals(create.args);
+    defer testing.allocator.free(create_args);
+    try testing.expectEqual(pack.target, create_args[0]);
+    try testing.expectEqual(entry_args[1], create_args[1]);
+
+    // S(task, cap, reuse) = rec = load cap; y'' = rec.0; v = f(y'', task); ret v
+    try testing.expectEqual(LIR.ProcAbi.erased_callable, f.spec(start).abi);
+    try testing.expectEqual(LIR.Suspends.may, f.spec(start).suspends);
+    const load = f.at(f.spec(start).body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.erased_capture_load, load.op);
+    const field = f.at(load.next).assign_ref;
+    const call = f.at(field.next).assign_call;
+    try testing.expectEqual(p, call.proc);
+    const start_args = try f.locals(f.spec(start).args);
+    defer testing.allocator.free(start_args);
+    const call_args = try f.locals(call.args);
+    defer testing.allocator.free(call_args);
+    try testing.expectEqualSlices(LocalId, &.{ field.target, start_args[0] }, call_args);
+    try testing.expectEqual(call.target, f.at(call.next).ret.value);
 }
 
 test "the verifier rejects a record that does not save every live value" {
