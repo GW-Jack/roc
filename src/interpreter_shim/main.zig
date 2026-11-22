@@ -311,10 +311,9 @@ comptime {
     @export(&shimGetOps, .{ .name = shim_symbols.roc_shim_get_ops });
     @export(&shimEntrypoint, .{ .name = shim_symbols.roc_entrypoint });
     @export(&shimEntrypointFromImage, .{ .name = shim_symbols.roc_entrypoint_from_image });
-    // A `Tasks` platform's host drives the tasks its provides entries return.
-    @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
-    @export(&builtins.task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
-    @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+    // A `Tasks` platform's host drives its tasks with `roc_task_resume`,
+    // `roc_task_wake` and `roc_task_free`. The builtins object this archive
+    // bundles exports them (design.md "Host Contract").
 }
 
 fn shimGetOps() callconv(.c) *anyopaque {

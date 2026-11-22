@@ -33886,8 +33886,10 @@ void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
-The interpreter shim exports `roc_task_resume`, `roc_task_wake` and
-`roc_task_free` (`RocTask.host_calls`). `roc_task_cancel` comes with the host
+The builtins object exports `roc_task_resume`, `roc_task_wake` and
+`roc_task_free` (`RocTask.host_calls`), and the interpreter shim gets them
+by bundling that object, so it never exports them itself: a second
+definition would collide in the program's link. `roc_task_cancel` comes with the host
 ABI, since it calls the host's `roc_task_abort`, which a host that does not
 opt in never defines.
 
@@ -33972,8 +33974,8 @@ byte:
   `task_hosted_slot(task)`.
 - **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`,
   `roc_task_wake` and `roc_task_free` from the builtins object linked into
-  it, so every backend links the same symbols. They are the same
-  `RocTask.host_calls` the interpreter shim exports.
+  it, so every backend links the same symbols. The interpreter shim bundles
+  the same object, so the interpreter's host gets them the same way.
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
   that every backend declares the same way.

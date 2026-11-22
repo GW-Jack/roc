@@ -531,6 +531,18 @@ pub fn exportWrappers(comptime set: ExportSet) void {
     }
 }
 
+/// The host's task calls (design.md "Host Contract", "Backends"):
+/// `roc_task_resume`, `roc_task_wake` and `roc_task_free`, in every payload,
+/// so a compiled `Tasks` program links the same ones on every backend. The
+/// interpreter shim exports the same functions.
+pub fn exportTaskHostCalls() void {
+    const task = @import("task.zig");
+    const shim_symbols = @import("shim_symbols.zig");
+    @export(&task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
+    @export(&task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
+    @export(&task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+}
+
 // Overflow-arithmetic exports (`roc__num_*` scheme) present in every payload.
 // One table drives both the `@export`s and the allowlist names, so the two
 // cannot disagree.

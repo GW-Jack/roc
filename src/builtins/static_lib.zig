@@ -29,6 +29,7 @@ const builtin_registry = @import("builtin_registry.zig");
 // Export overflow functions that might need compiler-rt symbols.
 comptime {
     builtin_registry.exportOverflowWrappers();
+    builtin_registry.exportTaskHostCalls();
 }
 
 // Wrapper namespace for consumers that call builtins via direct function

@@ -28,6 +28,7 @@ const builtin_registry = @import("builtin_registry.zig");
 
 comptime {
     builtin_registry.exportOverflowWrappers();
+    builtin_registry.exportTaskHostCalls();
 }
 
 /// Wrapper namespace for consumers that call builtins via direct function
