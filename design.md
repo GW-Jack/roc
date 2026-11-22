@@ -33836,11 +33836,14 @@ Waking a task records that the host wrote the hosted slot, and clears with
 the next resume.
 
 A root in a `Tasks` build is a task from the start. For each `provides`
-root that may suspend, the pass makes a start procedure and a task entry,
+root of a `Tasks` build, the pass makes a start procedure and a task entry,
 and the entry takes the root's place among the program's roots, so every
-backend wraps it as it wraps any root. The start procedure is an erased
+backend wraps it as it wraps any root. Every `provides` root becomes a task,
+not only those that may suspend, so the host's signature for a root depends
+only on the platform's mode, never on what the root's body calls. The pass
+learns the mode from the checked modules. The start procedure is an erased
 callable whose capture is the root's arguments and whose body calls the
-root with them and the task, as a tail site. The entry `E(args...,
+root with them, and with the task when the root may suspend, as a tail site. The entry `E(args...,
 result_out)` packs the start record and returns
 `task_create(start, result_out, sizes...)`; the sizes are literals the pass
 computed from the largest hosted result and the largest result of a

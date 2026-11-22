@@ -173,6 +173,10 @@ pub const TargetConfig = struct {
     /// their captures (`LirProgram.Result.erased_capture_prefix`).
     erased_capture_prefix: u32 = 0,
     specialization_strategy: SpecializationStrategy = .lss,
+    /// The platform's `concurrency` mode. Preparation reads it from the
+    /// checked modules; a `Tasks` build starts every `provides` root as a
+    /// task (design.md "Records And The Task").
+    concurrency_mode: base.ConcurrencyMode = .none,
     /// The consumer's actual code provider, declared before producer lowering.
     /// Reuse checking workers for generic post-check tasks when available.
     post_check_executor: ?base.post_check_task_executor.Executor = null,
@@ -1905,10 +1909,12 @@ pub fn prepareCheckedModulesMonotype(
         const omitted: u32 = @intCast(roots.requests.len - root_count);
         for (test_plan_metadata) |*metadata| metadata.request_index -= omitted;
     }
+    var prepared_target = target;
+    prepared_target.concurrency_mode = concurrencyModeOf(modules);
     return .{
         .allocator = allocator,
         .program = mono,
-        .target = target,
+        .target = prepared_target,
         .root_count = root_count,
         .test_plan_metadata = test_plan_metadata,
         .comptime_demand = if (target.comptime_value_reads) comptime_demand else null,
@@ -2358,7 +2364,11 @@ fn finishLoweredOutput(
         const provided = try allocator.alloc(bool, result.root_metadata.items.len);
         defer allocator.free(provided);
         for (result.root_metadata.items, provided) |metadata, *is_provided| is_provided.* = metadata.abi == .platform;
-        try ContinuationPass.run(allocator, &result.store, &result.layouts, .{ .procs = result.root_procs.items, .provided = provided });
+        try ContinuationPass.run(allocator, &result.store, &result.layouts, .{
+            .procs = result.root_procs.items,
+            .provided = provided,
+            .tasks = target.concurrency_mode == .tasks,
+        });
     }
     continuation_scope.end();
     // Every erased call names the allocation root its closure's unit belongs
@@ -2573,6 +2583,16 @@ pub const PreparedBoxy = struct {
         return program;
     }
 };
+
+/// The `concurrency` mode of the platform among `modules`, or `none`. Only a
+/// platform header sets a mode, and one lowering holds at most one platform.
+fn concurrencyModeOf(modules: CheckedModuleSet) base.ConcurrencyMode {
+    const root_mode = modules.root.module.moduleEnvConst().concurrency_mode;
+    if (root_mode != .none) return root_mode;
+    for (modules.root.relation_modules) |view| if (view.module_env.concurrency_mode != .none) return view.module_env.concurrency_mode;
+    for (modules.imports) |view| if (view.module_env.concurrency_mode != .none) return view.module_env.concurrency_mode;
+    return .none;
+}
 
 /// Validate the checked boundary for a `.boxy` build and collect its requests,
 /// before any lowering.

@@ -42,6 +42,10 @@ pub const Roots = struct {
     /// Whether each root is a platform `provides` entry. Only those may
     /// suspend: nothing else reaches a `suspending` hosted procedure.
     provided: []const bool,
+    /// A `Tasks` build: every `provides` root is started as a task, whether
+    /// or not it may suspend, so the host's signature depends only on the
+    /// platform's mode.
+    tasks: bool = false,
 
     pub const none: Roots = .{ .procs = &.{}, .provided = &.{} };
 };
@@ -108,7 +112,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         errdefer sites.deinit();
         try plans.append(allocator, .{ .proc = proc_id, .sites = sites, .task = undefined });
     }
-    if (plans.items.len == 0) return;
+    if (plans.items.len == 0 and !roots.tasks) return;
 
     // The task: a hidden argument after the explicit ones, passed on at
     // every site to a procedure. A hosted site takes it in the host's
@@ -217,9 +221,10 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
 
     std.debug.assert(roots.procs.len == roots.provided.len);
     for (roots.procs, roots.provided) |*root, provided| {
-        if (store.getProcSpecImmediate(root.*).suspends == .never) continue;
-        if (!provided) invariant("a root that is not a provides entry may suspend", .{});
-        root.* = try startRoot(allocator, store, layouts, root.*, buffers);
+        const may_suspend = store.getProcSpecImmediate(root.*).suspends != .never;
+        if (may_suspend and !provided) invariant("a root that is not a provides entry may suspend", .{});
+        if (!provided or !(may_suspend or roots.tasks)) continue;
+        root.* = try startRoot(allocator, store, layouts, root.*, may_suspend, buffers);
     }
 
     try SuspensionMarks.run(allocator, store);
@@ -241,19 +246,20 @@ fn nameDerived(allocator: Allocator, store: *LirStore, derived: ProcId, source: 
     try store.setProcDebugName(derived, text);
 }
 
-/// Start the root `root`, which may suspend, as a task. Its start procedure
-/// `S` is an erased callable whose capture is the root's explicit arguments
-/// and whose body calls the root with them and the task, as a tail site. Its
+/// Start the root `root` as a task. Its start procedure `S` is an erased
+/// callable whose capture is the root's explicit arguments and whose body
+/// calls the root with them, and with the task when it may suspend, as a
+/// tail site. Its
 /// task entry `E(args..., result_out)` takes the root's place: it packs the
 /// start record and returns the task it creates, whose root result goes to
 /// `result_out` (design.md "Host Contract"). Returns `E`.
-fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, buffers: Buffers) Allocator.Error!ProcId {
+fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, may_suspend: bool, buffers: Buffers) Allocator.Error!ProcId {
     const source = store.getProcSpecImmediate(root).*;
     const origin = store.stmtOrigin(source.body.get().?);
     const root_args = try copyLocals(allocator, store, source.args);
     defer allocator.free(root_args);
-    // The task is the root's last argument; the host passes the others.
-    const explicit = root_args[0 .. root_args.len - 1];
+    // A root that may suspend takes the task last; the host passes the others.
+    const explicit = if (may_suspend) root_args[0 .. root_args.len - 1] else root_args;
     const arg_layouts = try allocator.alloc(layout.Idx, explicit.len);
     defer allocator.free(arg_layouts);
     const capture_fields = try allocator.alloc(layout.StructField, explicit.len);
@@ -280,10 +286,10 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
         const capture = try freshLocal(store, &frame, allocator, .opaque_ptr);
         const reuse = try freshLocal(store, &frame, allocator, erased);
         const value = try freshLocal(store, &frame, allocator, source.ret_layout);
-        const call_args = try allocator.alloc(LocalId, explicit.len + 1);
+        const call_args = try allocator.alloc(LocalId, explicit.len + @intFromBool(may_suspend));
         defer allocator.free(call_args);
         for (arg_layouts, call_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
-        call_args[explicit.len] = task;
+        if (may_suspend) call_args[explicit.len] = task;
 
         const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
         var head = try store.addCFStmt(.{ .assign_call = .{
@@ -1532,6 +1538,54 @@ test "a provides root that may suspend is started as a task by an entry that tak
     defer testing.allocator.free(call_args);
     try testing.expectEqualSlices(LocalId, &.{ field.target, start_args[0] }, call_args);
     try testing.expectEqual(call.target, f.at(call.next).ret.value);
+}
+
+test "in a Tasks build a provides root that never suspends is still started as a task" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const z = try f.local();
+    const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
+    const count = f.store.procSpecCount();
+    var roots = [_]ProcId{quiet};
+
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .tasks = true });
+
+    const start: ProcId = @fromBackingInt(@intCast(count));
+    const entry: ProcId = @fromBackingInt(@intCast(count + 1));
+    try testing.expectEqual(entry, roots[0]);
+    try testing.expectEqual(layout.Idx.opaque_ptr, f.spec(entry).ret_layout);
+    // The root takes no task, so the start procedure calls it without one
+    // and never suspends; both buffers are empty.
+    const quiet_args = try f.locals(f.spec(quiet).args);
+    defer testing.allocator.free(quiet_args);
+    try testing.expectEqual(@as(usize, 1), quiet_args.len);
+    try testing.expectEqual(LIR.Suspends.never, f.spec(start).suspends);
+    const load = f.at(f.spec(start).body.get().?).assign_low_level;
+    const call = f.at(f.at(load.next).assign_ref.next).assign_call;
+    try testing.expectEqual(quiet, call.proc);
+    try testing.expectEqual(@as(usize, 1), GuardedList.borrowLen(f.store.getLocalSpan(call.args)));
+    var cursor = f.at(f.at(f.spec(entry).body.get().?).assign_struct.next).assign_packed_erased_fn.next;
+    var sizes: [4]i64 = undefined;
+    for (&sizes) |*size| {
+        const literal = f.at(cursor).assign_literal;
+        size.* = literal.value.i64_literal.value;
+        cursor = literal.next;
+    }
+    try testing.expectEqualSlices(i64, &.{ 0, 1, 0, 1 }, &sizes);
+}
+
+test "outside a Tasks build a provides root that never suspends keeps its place" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const z = try f.local();
+    const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
+    const count = f.store.procSpecCount();
+    var roots = [_]ProcId{quiet};
+
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+
+    try testing.expectEqual(quiet, roots[0]);
+    try testing.expectEqual(count, f.store.procSpecCount());
 }
 
 test "the verifier rejects a record that does not save every live value" {
