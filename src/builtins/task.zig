@@ -41,6 +41,23 @@ pub const BufferLayout = struct {
     result_buffer_alignment: usize,
 };
 
+/// The C-ABI task calls a backend's runtime exports to the host (design.md
+/// "Host Contract"). `roc_task_resume` returns a `RocTaskStatus`, a C enum:
+/// `PENDING`, `DONE`, `CANCELLED` in `Status` order.
+pub const host_calls = struct {
+    pub fn resumeTask(task: *RocTask) callconv(.c) u32 {
+        return @backingInt(task.resumeTask());
+    }
+
+    pub fn wake(task: *RocTask) callconv(.c) void {
+        task.wake();
+    }
+
+    pub fn free(task: *RocTask) callconv(.c) void {
+        task.free();
+    }
+};
+
 /// One task. The runtime owns it; LIR holds a pointer to it with no
 /// reference count.
 pub const RocTask = extern struct {
@@ -372,5 +389,22 @@ test "cancelling a woken task releases the hosted result instead of aborting" {
     try std.testing.expectEqual(@as(usize, 1), TestLog.slot_drops);
     try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
     task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "the host's C calls resume, wake and free a task and report its status as a C enum" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    const inner = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 10 }), &root, test_buffers);
+
+    try std.testing.expectEqual(@as(u32, 0), host_calls.resumeTask(task));
+    host_calls.wake(task);
+    try std.testing.expectEqual(@as(u32, 1), host_calls.resumeTask(task));
+    try std.testing.expectEqual(@as(u8, 20), root[0]);
+    host_calls.free(task);
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }

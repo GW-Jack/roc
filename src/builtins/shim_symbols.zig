@@ -27,6 +27,13 @@ pub const roc_shim_get_ops = "roc_shim_get_ops";
 pub const roc_entrypoint = "roc_entrypoint";
 /// Dispatches an entrypoint index into the shim, passing an embedded LIR image.
 pub const roc_entrypoint_from_image = "roc_entrypoint_from_image";
+/// Runs a parked or new task until it finishes or pauses again (design.md
+/// "Host Contract").
+pub const roc_task_resume = "roc_task_resume";
+/// Tells a parked task the host wrote its pending hosted result.
+pub const roc_task_wake = "roc_task_wake";
+/// Frees a task after it finished or was cancelled.
+pub const roc_task_free = "roc_task_free";
 /// The hosted dispatch table defined by the generated platform shim module.
 pub const roc_shim_hosted_fns = "roc_shim_hosted_fns";
 /// Number of entries in `roc_shim_hosted_fns`.

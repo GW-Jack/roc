@@ -33883,6 +33883,11 @@ void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
+The interpreter shim exports `roc_task_resume`, `roc_task_wake` and
+`roc_task_free` (`RocTask.host_calls`). `roc_task_cancel` comes with the host
+ABI, since it calls the host's `roc_task_abort`, which a host that does not
+opt in never defines.
+
 The host resumes a root once after creating it and once for each
 `roc_task_ready`, never from inside a hosted call or another resume. These
 symbols join the fixed runtime set and the glue templates of opting-in
