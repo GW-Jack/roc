@@ -21,6 +21,22 @@ pub fn load(gpa: Allocator, object_bytes: []const u8) LoadError!Image {
     return Image.load(gpa, object_bytes, .{ .resolve = resolveHostSymbol });
 }
 
+/// Binds the undefined symbols a caller provides beyond this compiler's own.
+pub const Resolver = relocatable_loader.Resolver;
+
+/// Load `object_bytes` against this compiler's host, offering each undefined
+/// symbol to `extra` first: a test host's hosted functions, which a platform
+/// host would define.
+pub fn loadWithExtraSymbols(gpa: Allocator, object_bytes: []const u8, extra: Resolver) LoadError!Image {
+    var chained = extra;
+    return Image.load(gpa, object_bytes, .{ .context = &chained, .resolve = resolveExtraThenHost });
+}
+
+fn resolveExtraThenHost(context: ?*anyopaque, name: []const u8) ?usize {
+    const extra: *const Resolver = @ptrCast(@alignCast(context.?));
+    return extra.lookup(name) orelse resolveHostSymbol(null, name);
+}
+
 fn resolveHostSymbol(_: ?*anyopaque, name: []const u8) ?usize {
     if (builtins.in_process_host.Symbol.fromName(name)) |symbol| return symbol.address();
     if (boxyRuntimeSymbol(name)) |address| return address;

@@ -4582,11 +4582,12 @@ pub fn build(b: *std.Build) void {
         }
 
         // Compile tests lower real apps to LIR and hand the result to the LLVM
-        // backend to assert on what it emits. Building the LLVM module is pure
-        // Zig (the vendored IR builder), so no LLVM library linkage is needed.
+        // backend, both to assert on what it emits and to run a `Tasks`
+        // program it compiled in this process against a test host, which
+        // needs the LLVM libraries to emit the object.
         if (std.mem.eql(u8, module_test.test_step.name, "compile")) {
-            module_test.test_step.root_module.addImport("llvm_codegen", llvm_codegen_module);
             module_test.test_step.root_module.addImport("postcheck", roc_modules.postcheck);
+            llvm_support.add(module_test.test_step);
         }
 
         if (std.mem.eql(u8, module_test.test_step.name, "glue")) {

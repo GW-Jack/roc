@@ -156,7 +156,8 @@ const WasmError = Allocator.Error || error{
 
 const LlvmOptionsError = Allocator.Error || error{UnsupportedTarget};
 
-const LlvmError = Allocator.Error || std.DynLib.Error || error{
+/// Why compiling, loading or running a program with the LLVM backend fails.
+pub const LlvmError = Allocator.Error || std.DynLib.Error || error{
     BitcodeParseError,
     CompilationFailed,
     NoBitcodeModules,
@@ -557,104 +558,136 @@ pub fn llvmCompileOptions(allocator: Allocator, target_usize: base.target.Target
     };
 }
 
-fn runLlvm(allocator: Allocator, program: Program) LlvmError!Result {
-    if (comptime builtin.target.os.tag == .freestanding) return error.LlvmBackendUnavailable;
+/// A program the LLVM backend compiled and this process loaded, with its
+/// static data, entered at `roc_eval_main` with `(ret, args)`.
+pub const LlvmImage = struct {
+    static_image: backend.StaticDataImage,
+    lib: object_image.Image,
+    /// The main procedure's argument layouts, in the order its entry reads them.
+    arg_layouts: []LayoutIdx,
+    allocator: Allocator,
 
-    const llvm_compile = @import("llvm_compile");
+    /// The entrypoint ABI of `roc_eval_main`.
+    pub const EntryFn = *const fn ([*]u8, ?*anyopaque) callconv(.c) void;
 
-    var static_image = backend.StaticDataImage.init(allocator, program.static_data) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Internal,
-    };
-    defer static_image.deinit();
-    const addresses = static_image.lirValueAddresses(allocator, program.static_data_value_count) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Internal,
-    };
-    defer allocator.free(addresses);
-    const static_procs = try @import("static_data").collectReferencedProcs(allocator, program.static_data);
-    defer allocator.free(static_procs);
-    const static_helpers = try backend.collectRequiredRcHelpers(allocator, program.static_data);
-    defer allocator.free(static_helpers);
+    /// Compile `program` with the LLVM backend and load it in this process.
+    /// `extra_symbols` binds undefined symbols beyond the compiler's own,
+    /// such as a test host's hosted functions.
+    pub fn load(allocator: Allocator, program: Program, extra_symbols: ?object_image.Resolver) LlvmError!LlvmImage {
+        if (comptime builtin.target.os.tag == .freestanding) return error.LlvmBackendUnavailable;
+        const llvm_compile = @import("llvm_compile");
+        var static_image = backend.StaticDataImage.init(allocator, program.static_data) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Internal,
+        };
+        errdefer static_image.deinit();
+        const addresses = static_image.lirValueAddresses(allocator, program.static_data_value_count) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Internal,
+        };
+        defer allocator.free(addresses);
+        const static_procs = try @import("static_data").collectReferencedProcs(allocator, program.static_data);
+        defer allocator.free(static_procs);
+        const static_helpers = try backend.collectRequiredRcHelpers(allocator, program.static_data);
+        defer allocator.free(static_helpers);
 
-    const proc = program.store.getProcSpec(program.main_proc);
-    const arg_layouts = try mainProcArgLayouts(allocator, program.store, program.main_proc);
-    defer allocator.free(arg_layouts);
+        const proc = program.store.getProcSpec(program.main_proc);
+        const arg_layouts = try mainProcArgLayouts(allocator, program.store, program.main_proc);
+        errdefer allocator.free(arg_layouts);
 
-    const llvm_entrypoints = [_]llvm_compile.MonoLlvmCodeGen.Entrypoint{.{
-        .symbol_name = "roc_eval_main",
-        .proc = program.main_proc,
-        .arg_layouts = arg_layouts,
-        .ret_layout = proc.ret_layout,
-    }};
-    const bitcode = generate: {
-        var codegen = llvm_compile.MonoLlvmCodeGen.init(allocator, program.store);
-        codegen.layout_store = program.layouts;
-        codegen.static_data_addresses = addresses;
-        codegen.proc_symbol_mode = .lir_symbol;
-        codegen.static_symbol_prefix = "roc_inspect_";
-        codegen.static_data_procs = static_procs;
-        codegen.static_data_rc_helpers = static_helpers;
-        defer codegen.deinit();
+        const llvm_entrypoints = [_]llvm_compile.MonoLlvmCodeGen.Entrypoint{.{
+            .symbol_name = "roc_eval_main",
+            .proc = program.main_proc,
+            .arg_layouts = arg_layouts,
+            .ret_layout = proc.ret_layout,
+        }};
+        const bitcode = generate: {
+            var codegen = llvm_compile.MonoLlvmCodeGen.init(allocator, program.store);
+            codegen.layout_store = program.layouts;
+            codegen.static_data_addresses = addresses;
+            codegen.proc_symbol_mode = .lir_symbol;
+            codegen.static_symbol_prefix = "roc_inspect_";
+            codegen.static_data_procs = static_procs;
+            codegen.static_data_rc_helpers = static_helpers;
+            defer codegen.deinit();
 
-        break :generate try codegen.generateEntrypointModule("roc_eval_module", llvm_entrypoints[0..]);
-    };
-    defer {
-        var owned = bitcode;
-        owned.deinit();
+            break :generate try codegen.generateEntrypointModule("roc_eval_module", llvm_entrypoints[0..]);
+        };
+        defer {
+            var owned = bitcode;
+            owned.deinit();
+        }
+
+        var compile_options = try llvmCompileOptions(allocator, program.layouts.targetUsize(), llvm_compile.bindings.IrOptimizationLevel.O3);
+        defer compile_options.deinit(allocator);
+        const object_bytes = try llvm_compile.compileBitcodeModulesToObject(
+            allocator,
+            std.Options.debug_io,
+            &.{bitcode.bitcode},
+            compile_options.options,
+        );
+        defer allocator.free(object_bytes);
+
+        var lib = (if (extra_symbols) |extra| object_image.loadWithExtraSymbols(allocator, object_bytes, extra) else object_image.load(allocator, object_bytes)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedObject,
+            error.MalformedObject,
+            error.UnsupportedRelocation,
+            error.UndefinedSymbol,
+            error.RelocationOutOfRange,
+            error.MappingFailed,
+            => return error.LlvmBackendUnavailable,
+        };
+        errdefer lib.deinit();
+        var functions = std.StringHashMap(usize).init(allocator);
+        defer functions.deinit();
+        const symbol_prefix = "roc_inspect_";
+        var symbol_name = std.ArrayList(u8).empty;
+        defer symbol_name.deinit(allocator);
+        for (program.static_data) |data_export| for (data_export.relocations) |relocation| {
+            if (relocation.kind != .function_pointer) continue;
+            const function = try functions.getOrPut(relocation.target_symbol_name);
+            if (function.found_existing) continue;
+            errdefer _ = functions.remove(relocation.target_symbol_name);
+            symbol_name.clearRetainingCapacity();
+            try symbol_name.ensureTotalCapacity(allocator, symbol_prefix.len + relocation.target_symbol_name.len);
+            symbol_name.appendSliceAssumeCapacity(symbol_prefix);
+            symbol_name.appendSliceAssumeCapacity(relocation.target_symbol_name);
+            const address = lib.lookup(*const anyopaque, symbol_name.items) orelse return error.LlvmBackendUnavailable;
+            function.value_ptr.* = @intFromPtr(address);
+        };
+        const Resolver = struct {
+            fn resolve(raw: ?*anyopaque, relocation: backend.StaticDataRelocation) ?usize {
+                const map: *const std.StringHashMap(usize) = @ptrCast(@alignCast(raw.?));
+                return map.get(relocation.target_symbol_name);
+            }
+        };
+        static_image.resolveFunctionRelocations(.{ .context = &functions, .resolve = Resolver.resolve }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Internal,
+        };
+        return .{ .static_image = static_image, .lib = lib, .arg_layouts = arg_layouts, .allocator = allocator };
     }
 
-    var compile_options = try llvmCompileOptions(allocator, program.layouts.targetUsize(), llvm_compile.bindings.IrOptimizationLevel.O3);
-    defer compile_options.deinit(allocator);
-    const object_bytes = try llvm_compile.compileBitcodeModulesToObject(
-        allocator,
-        std.Options.debug_io,
-        &.{bitcode.bitcode},
-        compile_options.options,
-    );
-    defer allocator.free(object_bytes);
+    /// Unload the program and free its static data.
+    pub fn deinit(self: *LlvmImage) void {
+        self.lib.deinit();
+        self.static_image.deinit();
+        self.allocator.free(self.arg_layouts);
+    }
 
-    var lib = object_image.load(allocator, object_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedObject,
-        error.MalformedObject,
-        error.UnsupportedRelocation,
-        error.UndefinedSymbol,
-        error.RelocationOutOfRange,
-        error.MappingFailed,
-        => return error.LlvmBackendUnavailable,
-    };
-    defer lib.deinit();
-    var functions = std.StringHashMap(usize).init(allocator);
-    defer functions.deinit();
-    const symbol_prefix = "roc_inspect_";
-    var symbol_name = std.ArrayList(u8).empty;
-    defer symbol_name.deinit(allocator);
-    for (program.static_data) |data_export| for (data_export.relocations) |relocation| {
-        if (relocation.kind != .function_pointer) continue;
-        const entry = try functions.getOrPut(relocation.target_symbol_name);
-        if (entry.found_existing) continue;
-        errdefer _ = functions.remove(relocation.target_symbol_name);
-        symbol_name.clearRetainingCapacity();
-        try symbol_name.ensureTotalCapacity(allocator, symbol_prefix.len + relocation.target_symbol_name.len);
-        symbol_name.appendSliceAssumeCapacity(symbol_prefix);
-        symbol_name.appendSliceAssumeCapacity(relocation.target_symbol_name);
-        const address = lib.lookup(*const anyopaque, symbol_name.items) orelse return error.LlvmBackendUnavailable;
-        entry.value_ptr.* = @intFromPtr(address);
-    };
-    const Resolver = struct {
-        fn resolve(raw: ?*anyopaque, relocation: backend.StaticDataRelocation) ?usize {
-            const map: *const std.StringHashMap(usize) = @ptrCast(@alignCast(raw.?));
-            return map.get(relocation.target_symbol_name);
-        }
-    };
-    static_image.resolveFunctionRelocations(.{ .context = &functions, .resolve = Resolver.resolve }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Internal,
-    };
+    /// The loaded program's entry.
+    pub fn entry(self: *const LlvmImage) LlvmError!EntryFn {
+        return self.lib.lookup(EntryFn, "roc_eval_main") orelse error.LlvmBackendUnavailable;
+    }
+};
 
-    const EntryFn = *const fn ([*]u8, ?*anyopaque) callconv(.c) void;
-    const entry = lib.lookup(EntryFn, "roc_eval_main") orelse return error.LlvmBackendUnavailable;
+fn runLlvm(allocator: Allocator, program: Program) LlvmError!Result {
+    var image = try LlvmImage.load(allocator, program, null);
+    defer image.deinit();
+    const entry = try image.entry();
+    const arg_layouts = image.arg_layouts;
+    const proc = program.store.getProcSpec(program.main_proc);
 
     var runtime_env = RuntimeHostEnv.init(allocator);
     defer runtime_env.deinit();

@@ -404,6 +404,9 @@ pub const MonoLlvmCodeGen = struct {
     /// Shims that give cold-path builtin calls the preserve_most convention,
     /// indexed by `BuiltinSymbol`. See `emitBuiltinCall`.
     cold_shims: [builtin_symbol_count]?ColdShim = @splat(null),
+    /// The slot-release adapters `suspend_save` hands the task runtime, one
+    /// per hosted result layout, compiled with the cold shims.
+    slot_drop_adapters: std.ArrayList(SlotDropAdapter) = .empty,
     /// How many enclosing cold switch arms the statement being emitted sits
     /// under. Non-zero routes builtin calls through preserve_most shims.
     cold_depth: u32 = 0,
@@ -784,6 +787,7 @@ pub const MonoLlvmCodeGen = struct {
         self.refcounted_bytes_scratch.deinit(self.allocator);
         self.hosted_abi_arena.deinit();
         self.tail_scratch_slots.deinit(self.allocator);
+        self.slot_drop_adapters.deinit(self.allocator);
         self.clearTailDrivers();
         self.tail_drivers.deinit(self.allocator);
         self.symbol_functions.deinit();
@@ -817,6 +821,7 @@ pub const MonoLlvmCodeGen = struct {
         self.builtin_functions = @splat(null);
         self.symbol_functions.clearRetainingCapacity();
         self.cold_shims = @splat(null);
+        self.slot_drop_adapters.clearRetainingCapacity();
         self.cold_depth = 0;
         self.clearStaticBytes();
         self.static_refcounted_backings.clearRetainingCapacity();
@@ -1148,6 +1153,7 @@ pub const MonoLlvmCodeGen = struct {
         }
         try self.compilePendingRcHelpers();
         try self.compilePendingColdShims();
+        try self.compilePendingSlotDropAdapters();
 
         for (entrypoints) |entrypoint| {
             try self.generateEntrypointWrapper(
@@ -4619,9 +4625,11 @@ pub const MonoLlvmCodeGen = struct {
         try self.setStmtDebugLocation(stmt_id);
         try self.emitSlotLifetimeMarkers(stmt_id);
         switch (stmt) {
-            // Milestone 1 implements suspension on the interpreter only
-            // (design.md "What Implements It First").
-            .suspend_save, .suspend_return => @panic("TODO: the LLVM backend does not implement suspension yet"),
+            .suspend_save => |save| {
+                try self.emitSuspendSave(save.task, self.store.stmtRow(save.data));
+                try work.append(wa, .{ .node = save.next });
+            },
+            .suspend_return => try self.emitSuspendReturn(),
             .dyn => |dyn_stmt| {
                 try self.emitDyn(dyn_stmt.target, self.store.stmtRow(dyn_stmt.data));
                 try work.append(wa, .{ .node = dyn_stmt.next });
@@ -5320,6 +5328,168 @@ pub const MonoLlvmCodeGen = struct {
         }
     }
 
+    /// The function pointer a packed callable stores for `callback`, or null.
+    /// A callback is selected at closure creation, which is not an RC
+    /// statement and makes no thread-confinement claim, so it is always the
+    /// atomic helper (atomic is always sound).
+    fn erasedCallbackValue(self: *MonoLlvmCodeGen, callback: lir.LIR.ErasedCallableOnDrop) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        return switch (callback) {
+            .none => builder.nullValue(try self.ptrType()) catch return error.OutOfMemory,
+            .rc_helper => |helper_key| if (try self.declareRcHelper(helper_key, .atomic)) |helper_fn|
+                helper_fn.toValue(builder)
+            else
+                builder.nullValue(try self.ptrType()) catch return error.OutOfMemory,
+        };
+    }
+
+    /// `suspend_save` (design.md "Backends"): pack the resume entry's record
+    /// over the saved values, always on the heap with one reference, and hand
+    /// that reference to the task's list with the hosted result's release.
+    fn emitSuspendSave(self: *MonoLlvmCodeGen, task: LocalId, data: lir.LIR.SuspendSaveData) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const ptr_ty = try self.ptrType();
+        const saved = self.store.getLocalSpan(data.saved);
+        try self.materializeLocalSpanIfDeferred(saved);
+        try self.materializeLocalIfDeferred(task);
+        const word = self.targetWordSize();
+        const capture_size = self.layoutByteSize(data.capture_layout);
+        const record = try self.callBuiltin(
+            .allocate_with_refcount,
+            ptr_ty,
+            &.{ self.ptrSizedIntType(), .i32, .i1 },
+            &.{
+                builder.intValue(self.ptrSizedIntType(), builtins.erased_callable.payloadSizeFor(word, capture_size)) catch return error.OutOfMemory,
+                builder.intValue(.i32, builtins.erased_callable.payload_alignment) catch return error.OutOfMemory,
+                builder.intValue(.i1, 0) catch return error.OutOfMemory,
+            },
+        );
+        const proc_fn = self.proc_registry.get(@backingInt(data.proc)) orelse return error.CompilationFailed;
+        try self.storePointer(record, proc_fn.toValue(builder));
+        try self.storePointer(try self.offsetPtr(record, word), try self.erasedCallbackValue(data.on_drop));
+        try self.storePointer(try self.offsetPtr(record, 2 * word), builder.nullValue(ptr_ty) catch return error.OutOfMemory);
+        try self.storeRawInt(record, 3 * word, self.ptrSizedIntType(), capture_size, word);
+        if (capture_size > 0) {
+            // The capture is the struct of the saved values, in order.
+            const capture = try self.offsetPtr(record, builtins.erased_callable.captureOffset(word));
+            const struct_idx = self.layoutValue(data.capture_layout).getStruct().idx;
+            for (0..saved.len) |i| {
+                const field_layout = self.layouts().getStructFieldLayoutByOriginalIndex(struct_idx, @intCast(i));
+                const field_size = self.layoutDataSize(field_layout);
+                if (field_size == 0) continue;
+                const offset = self.layouts().getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i));
+                try self.storeLocalToMemory(try self.offsetPtr(capture, offset), GuardedList.at(saved, i), field_size, self.alignmentForLayout(field_layout));
+            }
+        }
+        const slot_drop = switch (data.slot_drop) {
+            .none => builder.nullValue(ptr_ty) catch return error.OutOfMemory,
+            .rc_helper => |helper_key| try self.declareSlotDropAdapter(helper_key),
+        };
+        try self.callBuiltinVoid(.task_push_record, &.{ ptr_ty, ptr_ty, ptr_ty }, &.{ try self.loadPointer(self.slot(task).ptr), record, slot_drop });
+    }
+
+    /// `suspend_return` (design.md "Backends"): return from a paused frame
+    /// without writing its result. Nothing reads the result of a paused call,
+    /// so a register result is left zero.
+    fn emitSuspendReturn(self: *MonoLlvmCodeGen) Error!void {
+        const builder, const wip = try self.builderAndWip();
+        try self.emitFreeCarry();
+        if (self.current_dyn_result == null) {
+            if (self.fast_ret_registers) |registers| {
+                const ret_ty = try self.cAbiRegisterCarrierType(builder, registers);
+                _ = wip.ret((builder.zeroInitConst(ret_ty) catch return error.OutOfMemory).toValue()) catch return error.OutOfMemory;
+                return;
+            }
+        }
+        _ = wip.retVoid() catch return error.OutOfMemory;
+    }
+
+    /// Where compiled code finds the task's `pending`, `hosted_slot` and
+    /// `result_buffer` on this target (design.md "Backends").
+    fn taskFieldOffsets(self: *const MonoLlvmCodeGen) builtins.task.FieldOffsets {
+        return builtins.task.FieldOffsets.forPointerSize(self.targetWordSize());
+    }
+
+    /// `task_ready`: the task's `pending` byte is zero.
+    fn emitTaskReady(self: *MonoLlvmCodeGen, target: LocalId, task: LocalId) Error!void {
+        const builder, const wip = try self.builderAndWip();
+        const task_ptr = try self.loadPointer(self.slot(task).ptr);
+        const pending = wip.load(.normal, .i8, try self.offsetPtr(task_ptr, self.taskFieldOffsets().pending), LlvmBuilder.Alignment.fromByteUnits(1), "") catch return error.OutOfMemory;
+        const ready = wip.icmp(.eq, pending, builder.intValue(.i8, 0) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
+        try self.storeLocalBool(target, ready);
+    }
+
+    /// `task_set_pending`: store one in the task's `pending` byte.
+    fn emitTaskSetPending(self: *MonoLlvmCodeGen, task: LocalId) Error!void {
+        const builder, const wip = try self.builderAndWip();
+        const task_ptr = try self.loadPointer(self.slot(task).ptr);
+        _ = wip.store(.normal, builder.intValue(.i8, 1) catch return error.OutOfMemory, try self.offsetPtr(task_ptr, self.taskFieldOffsets().pending), LlvmBuilder.Alignment.fromByteUnits(1)) catch return error.OutOfMemory;
+    }
+
+    /// `task_hosted_slot` and `task_result_buffer`: the task's pointer field
+    /// at `offset`.
+    fn emitTaskPointerField(self: *MonoLlvmCodeGen, target: LocalId, task: LocalId, offset: u32) Error!void {
+        const task_ptr = try self.loadPointer(self.slot(task).ptr);
+        try self.storePointer(self.slot(target).ptr, try self.loadPointer(try self.offsetPtr(task_ptr, offset)));
+    }
+
+    /// `task_create`: the builtin takes the start record and returns the
+    /// task, with the operands in the statement's order (design.md
+    /// "Backends").
+    fn emitTaskCreate(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
+        const ptr_ty = try self.ptrType();
+        var values: [6]LlvmBuilder.Value = undefined;
+        values[0] = try self.loadPointer(self.slot(GuardedList.at(args, 0)).ptr);
+        values[1] = try self.loadPointer(self.slot(GuardedList.at(args, 1)).ptr);
+        for (values[2..], 2..) |*value, i| value.* = try self.loadLocalScalar(GuardedList.at(args, i), .u64);
+        const task = try self.callBuiltin(.task_create, ptr_ty, &.{ ptr_ty, ptr_ty, .i64, .i64, .i64, .i64 }, &values);
+        try self.storePointer(self.slot(target).ptr, task);
+    }
+
+    /// The adapter `suspend_save` hands the task runtime for a hosted result
+    /// of `helper_key`'s layout: `fn(slot, record, ops)` calling the result's
+    /// `host_drop` helper on the slot. Its body is emitted after the procs.
+    fn declareSlotDropAdapter(self: *MonoLlvmCodeGen, helper_key: layout.RcHelperKey) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        for (self.slot_drop_adapters.items) |adapter| {
+            if (adapter.helper_key.layout_idx == helper_key.layout_idx) return adapter.adapter.toValue(builder);
+        }
+        const helper = (try self.declareRcHelper(helper_key, .atomic)) orelse
+            llvmInvariantFmt("suspend_save names a slot release for layout {d}, which holds nothing refcounted", .{@backingInt(helper_key.layout_idx)});
+        const ptr_ty = try self.ptrType();
+        const fn_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
+        const name = builder.strtabStringFmt("roc_llvm_slot_drop_{d}", .{@backingInt(helper_key.layout_idx)}) catch return error.OutOfMemory;
+        const func = builder.addFunction(fn_ty, name, .default) catch return error.OutOfMemory;
+        func.setLinkage(.internal, builder);
+        try self.slot_drop_adapters.append(self.allocator, .{ .helper_key = helper_key, .helper = helper, .adapter = func, .compiled = false });
+        return func.toValue(builder);
+    }
+
+    /// Emit the body of every slot-release adapter: the `host_drop` helper
+    /// called on the slot with the runtime's ops. Runs after the procs, when
+    /// no function is mid-emission.
+    fn compilePendingSlotDropAdapters(self: *MonoLlvmCodeGen) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        for (self.slot_drop_adapters.items) |*adapter| {
+            if (adapter.compiled) continue;
+            adapter.compiled = true;
+            var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = adapter.adapter, .strip = true }) catch return error.OutOfMemory;
+            defer wip.deinit();
+            wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
+            _ = wip.call(.normal, .ccc, .none, adapter.helper.typeOf(builder), adapter.helper.toValue(builder), &.{ wip.arg(0), wip.arg(2) }, "") catch return error.OutOfMemory;
+            _ = wip.retVoid() catch return error.OutOfMemory;
+            wip.finish() catch return error.OutOfMemory;
+        }
+    }
+
+    /// A slot-release adapter and the helper it calls.
+    const SlotDropAdapter = struct {
+        helper_key: layout.RcHelperKey,
+        helper: LlvmBuilder.Function.Index,
+        adapter: LlvmBuilder.Function.Index,
+        compiled: bool,
+    };
+
     fn emitPackedErasedFn(
         self: *MonoLlvmCodeGen,
         target: LocalId,
@@ -5339,27 +5509,8 @@ pub const MonoLlvmCodeGen = struct {
         const ptr_ty = try self.ptrType();
         const capture_size = if (capture_layout) |idx| self.layoutByteSize(idx) else 0;
         const proc_fn = self.proc_registry.get(@backingInt(proc_id)) orelse return error.CompilationFailed;
-        const null_ptr = builder.nullValue(ptr_ty) catch return error.OutOfMemory;
-        const on_drop_value = switch (on_drop) {
-            .none => null_ptr,
-            .rc_helper => |helper_key| blk: {
-                // `on_drop` is selected here at closure creation, which is not
-                // an RC statement and makes no thread-confinement claim, so it
-                // is always the atomic helper (atomic is always sound).
-                break :blk if (try self.declareRcHelper(helper_key, .atomic)) |helper_fn|
-                    helper_fn.toValue(builder)
-                else
-                    null_ptr;
-            },
-        };
-
-        const on_copy_value = switch (on_copy) {
-            .none => null_ptr,
-            .rc_helper => |key| if (try self.declareRcHelper(key, .atomic)) |helper|
-                helper.toValue(builder)
-            else
-                null_ptr,
-        };
+        const on_drop_value = try self.erasedCallbackValue(on_drop);
+        const on_copy_value = try self.erasedCallbackValue(on_copy);
         const data_ptr = if (reuse) |reuse_local| blk: {
             const capture_src = try self.allocEntryBlockSlot(
                 .i8,
@@ -5925,7 +6076,11 @@ pub const MonoLlvmCodeGen = struct {
             .ptr_store => try self.emitPtrStore(GuardedList.at(arg_locals, 0), GuardedList.at(arg_locals, 1)),
             .ptr_load => try self.emitPtrLoad(target, GuardedList.at(arg_locals, 0)),
             .ptr_cast => try self.emitPtrCast(target, GuardedList.at(arg_locals, 0)),
-            .task_ready, .task_set_pending, .task_hosted_slot, .task_result_buffer, .task_create => @panic("TODO: task operations are not implemented in the LLVM backend"),
+            .task_ready => try self.emitTaskReady(target, GuardedList.at(arg_locals, 0)),
+            .task_set_pending => try self.emitTaskSetPending(GuardedList.at(arg_locals, 0)),
+            .task_hosted_slot => try self.emitTaskPointerField(target, GuardedList.at(arg_locals, 0), self.taskFieldOffsets().hosted_slot),
+            .task_result_buffer => try self.emitTaskPointerField(target, GuardedList.at(arg_locals, 0), self.taskFieldOffsets().result_buffer),
+            .task_create => try self.emitTaskCreate(target, arg_locals),
             .crash => try self.emitCrashBytes("Roc crashed"),
             // Every remaining op is a numeric conversion; the comptime check keeps
             // this switch exhaustive when a non-conversion op is added.

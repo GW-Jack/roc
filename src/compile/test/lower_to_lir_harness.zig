@@ -295,6 +295,26 @@ pub fn interpreterStaticData(lowered: *const lir.CheckedPipeline.LoweredProgram)
     return try eval.InterpreterStaticData.init(std.testing.allocator, exports, lowered.lir_result.static_data_values.items.len);
 }
 
+/// The static data a native backend links into the lowered program, built at
+/// the program's own pointer width. Called from a lowered or prepared
+/// inspection; the caller frees it with `freeNativeStaticData`.
+pub fn nativeStaticData(lowered: *const lir.CheckedPipeline.LoweredProgram) std.mem.Allocator.Error![]static_materialization.StaticDataExport {
+    const modules = inspected_modules orelse
+        base.invariant("nativeStaticData is called only from a lowered or prepared inspection", .{});
+    return static_materialization.buildStaticDataForWidth(std.testing.allocator, .{
+        .root = modules.root,
+        .imports = modules.imports,
+    }, lowered, lowered.target_usize, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedTarget => base.invariant("a harness program's own pointer width has no static data layout", .{}),
+    };
+}
+
+/// Free what `nativeStaticData` built.
+pub fn freeNativeStaticData(exports: []static_materialization.StaticDataExport) void {
+    static_materialization.deinitStaticData(std.testing.allocator, exports);
+}
+
 /// Lower an app at `app_path` to LIR with explicit lowering options, then run
 /// a focused invariant check against the whole lowered program, for tests that
 /// drive a backend over the result.

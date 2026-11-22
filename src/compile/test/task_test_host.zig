@@ -63,33 +63,52 @@ pub const TestHost = struct {
         const self: *TestHost = @ptrCast(@alignCast(context));
         if (std.mem.eql(u8, call.symbol, "roc_host_fetch")) {
             // The host's shape: the task and the result pointer come first.
-            const task_addr = readArg(usize, call, 0);
-            const out: *align(1) RocStr = @ptrFromInt(readArg(usize, call, 1));
-            const url = readArg(RocStr, call, 2);
-            try self.note("fetch", url);
-            switch (self.mode) {
-                .ready => {
-                    out.* = try self.answer(url);
-                    url.decref(self.ops);
-                    std.mem.writeInt(u32, call.ret[0..4], poll_ready, .little);
-                },
-                .pause => {
-                    // A task waits on at most one hosted operation at a time.
-                    if (self.pending != null) return error.RuntimeError;
-                    self.pending = .{ .task = @ptrFromInt(task_addr), .out = out, .url = url };
-                    self.pauses += 1;
-                    std.mem.writeInt(u32, call.ret[0..4], poll_pending, .little);
-                },
-            }
+            const poll = try self.fetch(@ptrFromInt(readArg(usize, call, 0)), @ptrFromInt(readArg(usize, call, 1)), readArg(RocStr, call, 2));
+            std.mem.writeInt(u32, call.ret[0..4], poll, .little);
             return;
         }
-        if (std.mem.eql(u8, call.symbol, "roc_host_log")) {
-            const text = readArg(RocStr, call, 0);
-            try self.note("log", text);
-            text.decref(self.ops);
-            return;
-        }
+        if (std.mem.eql(u8, call.symbol, "roc_host_log")) return self.log(readArg(RocStr, call, 0));
         return error.UnsupportedHostedFunction;
+    }
+
+    /// `roc_host_fetch`: answer at once, or pause the task on the operation.
+    /// Only a pause needs the task.
+    fn fetch(self: *TestHost, task: ?*RocTask, out: *align(1) RocStr, url: RocStr) eval.Interpreter.Error!u32 {
+        try self.note("fetch", url);
+        switch (self.mode) {
+            .ready => {
+                out.* = try self.answer(url);
+                url.decref(self.ops);
+                return poll_ready;
+            },
+            .pause => {
+                // A task waits on at most one hosted operation at a time.
+                if (self.pending != null) return error.RuntimeError;
+                self.pending = .{ .task = task orelse return error.RuntimeError, .out = out, .url = url };
+                self.pauses += 1;
+                return poll_pending;
+            },
+        }
+    }
+
+    /// `roc_host_log`: record the text and release it.
+    fn log(self: *TestHost, text: RocStr) eval.Interpreter.Error!void {
+        try self.note("log", text);
+        text.decref(self.ops);
+    }
+
+    /// Serve compiled code's hosted calls (design.md "Backends") until
+    /// `leaveCAbi`: `resolveCAbiSymbol` binds the fixture's hosted symbols to
+    /// functions that reach this host.
+    pub fn enterCAbi(self: *TestHost) void {
+        std.debug.assert(c_abi_host == null);
+        c_abi_host = self;
+    }
+
+    /// Stop serving compiled code's hosted calls.
+    pub fn leaveCAbi(self: *TestHost) void {
+        std.debug.assert(c_abi_host == self);
+        c_abi_host = null;
     }
 
     fn answer(self: *TestHost, url: RocStr) std.mem.Allocator.Error!RocStr {
@@ -150,6 +169,36 @@ pub const TestHost = struct {
 
 /// The host a cancel's abort reaches: `roc_task_abort` takes only the task.
 var active_host: ?*TestHost = null;
+
+/// The host compiled code's hosted calls reach, between `enterCAbi` and
+/// `leaveCAbi`. A C-ABI hosted function has no context argument.
+var c_abi_host: ?*TestHost = null;
+
+/// The first error a C-ABI hosted call hit, which it cannot return.
+pub var c_abi_failure: ?eval.Interpreter.Error = null;
+
+/// Bind the fixture's hosted symbols, for an object compiled code is loaded
+/// from, to the C-ABI functions that reach the entered host.
+pub fn resolveCAbiSymbol(_: ?*anyopaque, name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "roc_host_fetch")) return @intFromPtr(&cAbiFetch);
+    if (std.mem.eql(u8, name, "roc_host_log")) return @intFromPtr(&cAbiLog);
+    return null;
+}
+
+/// `u32 roc_host_fetch(RocTask *task, RocStr *out, RocStr url)`.
+fn cAbiFetch(task: *RocTask, out: *RocStr, url: RocStr) callconv(.c) u32 {
+    return c_abi_host.?.fetch(task, out, url) catch |err| blk: {
+        if (c_abi_failure == null) c_abi_failure = err;
+        break :blk poll_ready;
+    };
+}
+
+/// `void roc_host_log(RocStr text)`.
+fn cAbiLog(text: RocStr) callconv(.c) void {
+    c_abi_host.?.log(text) catch |err| {
+        if (c_abi_failure == null) c_abi_failure = err;
+    };
+}
 
 fn abortPending(task: *RocTask) callconv(.c) void {
     const host = active_host.?;
