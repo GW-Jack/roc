@@ -19235,6 +19235,7 @@ fn passStepLabel(step: lir.CheckedPipeline.PassStep) []const u8 {
         .str_append => "Str Append",
         .tag_reachability => "Tag Reachability",
         .reachable_procs_before_arc => "Reachable Procs",
+        .continuation_pass => "Continuations",
         .frame_callables => "Frame Callables",
         .tail_drive => "Tail Drive",
         .reachable_procs_after_arc => "Reachable Procs After ARC",
@@ -19307,7 +19308,7 @@ fn recordLirPassDetail(reporter: *progress.Reporter, snapshot: lir.CheckedPipeli
                 after_len += 1;
                 after_total +|= ns;
             },
-            .suspension_marks, .erased_owner, .return_slot, .str_append, .tag_reachability, .reachable_procs_before_arc => {
+            .suspension_marks, .erased_owner, .return_slot, .str_append, .tag_reachability, .reachable_procs_before_arc, .continuation_pass => {
                 before[before_len] = .{ .name = passStepLabel(step), .ns = ns };
                 before_len += 1;
             },

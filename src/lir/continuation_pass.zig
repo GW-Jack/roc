@@ -12,12 +12,14 @@
 //! host's shape: the task and a result pointer first, a `RocPoll` result.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const collections = @import("collections");
 const core = @import("lir_core");
 const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
 const ContinuationSites = @import("continuation_sites.zig");
 const SuspensionMarks = @import("suspension_marks.zig");
+const invariant = @import("base").invariant;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -126,7 +128,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Alloc
                     .args = .empty(),
                     .ret_layout = source.ret_layout,
                 }, store.procLoc(plan.proc));
-                try store.copyProcDebugInfo(info.continuation.?, plan.proc);
+                try nameDerived(allocator, store, info.continuation.?, plan.proc, "continuation", ordinal);
                 info.resume_entry = try store.addProcSpec(.{
                     .name = store.freshSyntheticSymbol(),
                     .identity = source.identity.derived("resume", &key),
@@ -134,7 +136,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Alloc
                     .ret_layout = source.ret_layout,
                     .abi = .erased_callable,
                 }, store.procLoc(plan.proc));
-                try store.copyProcDebugInfo(info.resume_entry.?, plan.proc);
+                try nameDerived(allocator, store, info.resume_entry.?, plan.proc, "resume", ordinal);
                 info.capture_layout = try captureLayout(allocator, store, layouts, site.live_after, call.target);
                 info.on_drop = hostDrop(layouts, info.capture_layout);
                 if (hosted) info.slot_drop = hostDrop(layouts, store.getLocal(call.target).layout_idx);
@@ -174,6 +176,18 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Alloc
     while (hosted_iter.next()) |index| try hostShape(store, layouts, @fromBackingInt(@intCast(index)));
 
     try SuspensionMarks.run(allocator, store);
+    if (builtin.mode == .debug) try verify(allocator, store);
+}
+
+/// Give a procedure the pass derives from `source` its source location and
+/// a debug name that says which of `source`'s sites it belongs to, so dumps
+/// and name-keyed tests tell it from `source`.
+fn nameDerived(allocator: Allocator, store: *LirStore, derived: ProcId, source: ProcId, role: []const u8, ordinal: usize) Allocator.Error!void {
+    try store.copyProcDebugInfo(derived, source);
+    const name = store.procDebugName(source) orelse return;
+    const text = try std.fmt.allocPrint(allocator, "{s}#{s}{d}", .{ name, role, ordinal });
+    defer allocator.free(text);
+    try store.setProcDebugName(derived, text);
 }
 
 fn isHosted(store: *const LirStore, proc: ProcId) bool {
@@ -708,6 +722,159 @@ fn buildContinuation(
     spec.shapes = spec.shapes.merged(store.shapes);
 }
 
+/// The Debug check of the pass's output (design.md "Invariants"). It
+/// analyzes the output's sites afresh and checks that every site that is
+/// not a tail site has its pending test and edge, that each edge saves
+/// exactly the values live after its site other than the result, that each
+/// resume entry calls its continuation with its captures in order, and that
+/// every call to a continuation is a tail site.
+fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
+    var continuations = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
+    defer continuations.deinit(allocator);
+    const Call = struct { callee: ProcId, tail: bool };
+    var calls = std.ArrayList(Call).empty;
+    defer calls.deinit(allocator);
+
+    for (0..store.procSpecCount()) |index| {
+        const proc_id: ProcId = @fromBackingInt(@intCast(index));
+        const proc = store.getProcSpecImmediate(proc_id);
+        if (proc.body.get() == null or proc.suspends == .never) continue;
+        var sites = try ContinuationSites.analyze(allocator, store, proc_id);
+        defer sites.deinit();
+        for (sites.sites) |site| {
+            const call = store.getCFStmtImmediate(site.call).assign_call;
+            try calls.append(allocator, .{ .callee = call.proc, .tail = site.tail });
+            if (site.tail) continue;
+            const save_id = pendingSave(store, call) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
+            const save = store.getCFStmtImmediate(save_id).suspend_save;
+            const data = store.stmtRow(save.data);
+            continuations.set(@backingInt(try verifyResumeEntry(allocator, store, data)));
+
+            // The saved values are the ones live after the site, apart from
+            // the call's result, the task and a hosted site's slot address.
+            var expected = std.ArrayList(LocalId).empty;
+            defer expected.deinit(allocator);
+            const call_args = store.getLocalSpan(call.args);
+            const slot: ?LocalId = if (isHosted(store, call.proc)) GuardedList.at(call_args, 1) else null;
+            for (site.live_after) |live| {
+                if (live == call.target or live == save.task or (slot != null and live == slot.?)) continue;
+                try expected.append(allocator, live);
+            }
+            var saved = std.ArrayList(LocalId).empty;
+            defer saved.deinit(allocator);
+            for (0..GuardedList.borrowLen(store.getLocalSpan(data.saved))) |i| try saved.append(allocator, GuardedList.at(store.getLocalSpan(data.saved), i));
+            std.mem.sort(LocalId, saved.items, {}, localLessThan);
+            if (!std.mem.eql(LocalId, expected.items, saved.items)) invariant("a pending edge does not save exactly the values live after its site", .{});
+        }
+    }
+    for (calls.items) |call| {
+        if (continuations.isSet(@backingInt(call.callee)) and !call.tail) invariant("a call to a continuation is not a tail site", .{});
+    }
+}
+
+/// The `suspend_save` that a site's pending test leads to on its cold side,
+/// or null when the site has no pending test.
+fn pendingSave(store: *const LirStore, call: @FieldType(LIR.CFStmt, "assign_call")) ?CFStmtId {
+    const next = store.getCFStmtImmediate(call.next).*;
+    if (isHosted(store, call.proc)) {
+        if (next != .switch_stmt) return null;
+        const branch = next.switch_stmt;
+        if (branch.cond != call.target or !branch.default_is_cold) return null;
+        const pending = store.getCFStmtImmediate(branch.default_branch).*;
+        if (pending != .assign_low_level or pending.assign_low_level.op != .task_set_pending) return null;
+        if (store.getCFStmtImmediate(pending.assign_low_level.next).* != .suspend_save) return null;
+        return pending.assign_low_level.next;
+    }
+    if (next != .assign_low_level or next.assign_low_level.op != .task_ready) return null;
+    const test_stmt = store.getCFStmtImmediate(next.assign_low_level.next).*;
+    if (test_stmt != .switch_initialized_payload) return null;
+    const pending_test = test_stmt.switch_initialized_payload;
+    if (pending_test.cond != next.assign_low_level.target or pending_test.payload != call.target or !pending_test.uninitialized_is_cold) return null;
+    if (store.getCFStmtImmediate(pending_test.uninitialized_branch).* != .suspend_save) return null;
+    return pending_test.uninitialized_branch;
+}
+
+/// Check that the resume entry `data` names reads its captures as fields in
+/// order and passes them, with at most the call's result among them, then
+/// its task, to a procedure taking exactly those arguments. Returns that
+/// procedure, the site's continuation.
+fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.SuspendSaveData) Allocator.Error!ProcId {
+    const entry = store.getProcSpecImmediate(data.proc);
+    if (entry.abi != .erased_callable) invariant("a pending edge saves a procedure that is not an erased callable", .{});
+    const entry_args = store.getLocalSpan(entry.args);
+    if (GuardedList.borrowLen(entry_args) != 3) invariant("a resume entry does not take the task, its capture and its reuse input", .{});
+    const task = GuardedList.at(entry_args, 0);
+
+    var fields = std.ArrayList(LocalId).empty;
+    defer fields.deinit(allocator);
+    var result: ?LocalId = null;
+    var at = entry.body.get() orelse invariant("a resume entry has no body", .{});
+    const call = while (true) {
+        switch (store.getCFStmtImmediate(at).*) {
+            .assign_ref => |read| {
+                if (read.op.kind != .field or read.op.index != fields.items.len) invariant("a resume entry reads its captures out of order", .{});
+                try fields.append(allocator, read.target);
+                at = read.next;
+            },
+            .assign_low_level => |op| {
+                if (op.op == .ptr_load) result = op.target;
+                at = op.next;
+            },
+            .assign_struct => |zero_sized| {
+                try fields.append(allocator, zero_sized.target);
+                at = zero_sized.next;
+            },
+            .assign_call => |found| break found,
+            .init_uninitialized,
+            .assign_literal,
+            .assign_call_erased,
+            .assign_packed_erased_fn,
+            .assign_list,
+            .assign_tag,
+            .store_struct,
+            .store_tag,
+            .set_local,
+            .debug,
+            .expect,
+            .expect_err,
+            .dyn,
+            .runtime_error,
+            .comptime_exhaustiveness_failed,
+            .incref,
+            .decref,
+            .decref_if_initialized,
+            .free,
+            .switch_stmt,
+            .switch_initialized_payload,
+            .str_match,
+            .str_match_set,
+            .join,
+            .jump,
+            .ret,
+            .crash,
+            .suspend_save,
+            .suspend_return,
+            => invariant("a resume entry's body is not the shape the continuation pass builds", .{}),
+        }
+    };
+    if (fields.items.len != GuardedList.borrowLen(store.getLocalSpan(data.saved))) invariant("a resume entry reads a different number of captures than its record saves", .{});
+
+    const call_args = store.getLocalSpan(call.args);
+    const count = GuardedList.borrowLen(call_args);
+    if (count == 0 or GuardedList.at(call_args, count - 1) != task) invariant("a resume entry does not pass its task last", .{});
+    var next_field: usize = 0;
+    for (0..count - 1) |i| {
+        const arg = GuardedList.at(store.getLocalSpan(call.args), i);
+        if (result != null and arg == result.?) continue;
+        if (next_field >= fields.items.len or fields.items[next_field] != arg) invariant("a resume entry does not pass its captures in order", .{});
+        next_field += 1;
+    }
+    if (next_field != fields.items.len) invariant("a resume entry does not pass every capture", .{});
+    const continuation = store.getProcSpecImmediate(call.proc);
+    if (GuardedList.borrowLen(store.getLocalSpan(continuation.args)) != count) invariant("a resume entry's call does not match its continuation's arguments", .{});
+    return call.proc;
+}
+
 const testing = std.testing;
 
 const Fixture = struct {
@@ -1073,4 +1240,31 @@ test "a hosted site reads the slot's address, branches on the poll, and the host
     const capture_load = f.at(entry.body.get().?).assign_low_level;
     const field = f.at(capture_load.next).assign_ref;
     try testing.expectEqual(LIR.LowLevel.task_hosted_slot, f.at(field.next).assign_low_level.op);
+}
+
+/// Run the pass on a procedure with one site, then drop the record's one
+/// saved value, as a pass that lost track of a live value would.
+fn verifyRecordMissingAValue() Allocator.Error!void {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const y = try f.local();
+    const t = try f.local();
+    const s = try f.local();
+    const ret = try f.stmt(.{ .ret = .{ .value = s } });
+    const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, y }), .next = ret } });
+    const first = try f.callSeed(t, build);
+    _ = try f.addProc(&.{y}, &.{ y, t, s }, first);
+    try run(testing.allocator, &f.store, &f.layouts);
+
+    const read = f.at(f.at(first).assign_call.next).assign_low_level;
+    const edge = f.at(read.next).switch_initialized_payload.uninitialized_branch;
+    var data = f.store.stmtRow(f.at(edge).suspend_save.data);
+    data.saved = .empty();
+    const dropped = try f.store.addStmtRow(LIR.SuspendSaveData, data);
+    f.store.getCFStmtPtr(edge).suspend_save.data = dropped;
+    try verify(testing.allocator, &f.store);
+}
+
+test "the verifier rejects a record that does not save every live value" {
+    try @import("base").death_test.expectPanic("a resume entry reads a different number of captures", verifyRecordMissingAValue, .{});
 }

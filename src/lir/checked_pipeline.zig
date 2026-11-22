@@ -31,6 +31,7 @@ pub const CompletedErasedMembers = postcheck.CompletedErasedMembers;
 pub const LiteralDemand = postcheck.LiteralDemand;
 const TagReachability = @import("tag_reachability.zig");
 const ReachableProcs = @import("reachable_procs.zig");
+const ContinuationPass = @import("continuation_pass.zig");
 const DebugPrint = @import("debug_print.zig");
 const LIR = core.LIR;
 const CheckedArithmetic = core.CheckedArithmetic;
@@ -889,6 +890,9 @@ pub const PassStep = enum {
     tag_reachability,
     /// Dropping procedures and data nothing references, before ARC.
     reachable_procs_before_arc,
+    /// Making the continuations, resume entries and pending edges of the
+    /// procedures that may suspend.
+    continuation_pass,
     /// Solving which function parameters never outlive their call, and
     /// building the callables passed only to them in their frames.
     frame_callables,
@@ -2345,6 +2349,12 @@ fn finishLoweredOutput(
         try ReachableProcs.run(&lowered.lir_result);
     }
     reachable_scope.end();
+    // The continuations copy final bodies, so every rewrite before ARC has
+    // run, and every procedure they reach is already reachable; what they
+    // add is reachable by construction (design.md "The Continuation Pass").
+    var continuation_scope = PassStepScope.begin(target.timing, .continuation_pass);
+    try ContinuationPass.run(allocator, &lowered.lir_result.store, &lowered.lir_result.layouts);
+    continuation_scope.end();
     // Every erased call names the allocation root its closure's unit belongs
     // to, reached through the representation-transparent aliases of the
     // final body: rewrites above (inlining, join forwarding and pruning) can
