@@ -738,6 +738,9 @@ const CustomCase = enum {
     issue_12769_wasm_host_parameter_limit_speed,
     issue_12769_wasm_object_entry_parameter_limit,
     issue_12741_wasm_generic_tail_calls_dev,
+    tasks_wasm_dev,
+    tasks_wasm_size,
+    tasks_wasm_speed,
     issue_12741_wasm_generic_tail_calls_size,
     issue_12741_wasm_generic_tail_calls_speed,
     issue_12848_wasm_shared_helper_emitted_once_size,
@@ -3268,6 +3271,11 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run cancels a concurrency Tasks program after the host answered the fetch inside an app procedure on LLVM", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .app_args = &.{ "--cancel-woken-at", "2" }, .contains = &.{.{ .stream = .stderr, .text = "cancelled at pause 2\nfetches: 2, pauses: 2\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that cancels parked inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{ "--cancel-at", "2" }, .stderr_contains = "cancelled at pause 2\nfetches: 2, pauses: 2\n" } } } } },
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that cancels parked inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{ "--cancel-at", "2" }, .stderr_contains = "cancelled at pause 2\nfetches: 2, pauses: 2\n" } } } } },
+    // A `Tasks` program built for wasm32 runs inside a wasm host that
+    // pauses, answers at once, and cancels parked and woken tasks.
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on the dev backend that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .dev, .body = .{ .custom = .tasks_wasm_dev } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (size) that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .size, .body = .{ .custom = .tasks_wasm_size } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (speed) that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .speed, .body = .{ .custom = .tasks_wasm_speed } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check writes parse errors to stderr", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains_any = &.{.{ .needles = &parse_error_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "direct roc rejects compiler-owned glue platform as hostless", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "src/glue/src/DebugGlue.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{ .{ .stream = .stderr, .text = "empty targets section" }, .{ .stream = .stderr, .text = "roc glue" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "expected platform string" }, .{ .stream = .stderr, .text = "panic" }, .{ .stream = .stderr, .text = "unreachable" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check displays correct file path in parse error messages", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{.{ .stream = .stderr, .text = "has_parse_error.roc" }}, .not_contains = &.{.{ .stream = .stderr, .text = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa" }} } } },
@@ -7474,6 +7482,9 @@ fn runCustomCase(
         .issue_12769_wasm_host_parameter_limit_speed => customIssue12769WasmHostParameterLimit(io, allocator, &env, &timer, timeout_ms, "--opt=speed"),
         .issue_12769_wasm_object_entry_parameter_limit => customIssue12769WasmObjectEntryParameterLimit(io, allocator, &env, &timer, timeout_ms),
         .issue_12741_wasm_generic_tail_calls_dev => customIssue12741WasmGenericTailCalls(io, allocator, &env, &timer, timeout_ms, "--opt=dev"),
+        .tasks_wasm_dev => customTasksWasm(io, allocator, &env, &timer, timeout_ms, "--opt=dev"),
+        .tasks_wasm_size => customTasksWasm(io, allocator, &env, &timer, timeout_ms, "--opt=size"),
+        .tasks_wasm_speed => customTasksWasm(io, allocator, &env, &timer, timeout_ms, "--opt=speed"),
         .issue_12741_wasm_generic_tail_calls_size => customIssue12741WasmGenericTailCalls(io, allocator, &env, &timer, timeout_ms, "--opt=size"),
         .issue_12848_wasm_shared_helper_emitted_once_size => customIssue12848WasmSharedHelperEmittedOnce(io, allocator, &env, &timer, timeout_ms),
         .issue_13028_wasm_size_small_copy_is_memory_copy => customIssue13028WasmSizeSmallCopyIsMemoryCopy(io, allocator, &env, &timer, timeout_ms),
@@ -15492,6 +15503,71 @@ fn customIssue12741WasmGenericTailCalls(
         return customFailure(allocator, timer, "failed to read the generic tail call module's allocation counts: {}", .{err});
     if (outstanding != 1) {
         return customFailure(allocator, timer, "generic tail call wasm left {d} allocations outstanding, not just its result", .{outstanding});
+    }
+    return null;
+}
+
+/// `test/concurrency-tasks/app_fetch_twice.roc` built for wasm32 and run in
+/// the platform's wasm host (`wasm_host.zig`), once per host mode set with
+/// `wasm_configure`: pausing at every fetch, answering at once, cancelling a
+/// parked task (the program aborts the fetch through `roc_task_abort`) and a
+/// woken one (the program releases the answer). Each run must report what
+/// the native host reports and leave allocations balanced, and the module
+/// imports nothing but the harness's `env` functions, so the task calls
+/// resolved inside the link.
+fn customTasksWasm(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    opt_arg: []const u8,
+) ?TestResult {
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "tasks.wasm" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate wasm output path: {}", .{err});
+    defer allocator.free(output_path);
+    const output_arg = outputArg(allocator, output_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate wasm output argument: {}", .{err});
+    defer allocator.free(output_arg);
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "build", "--target=wasm32", opt_arg, "--specialize=yes", "--no-cache", output_arg },
+        .roc_file = "test/concurrency-tasks/app_fetch_twice.roc",
+        .exit = .success,
+        .contains = &.{.{ .stream = .stdout, .text = "successfully building" }},
+        .not_contains = &.{.{ .stream = .stderr, .text = "panic" }},
+    })) |failure| return failure;
+    if (validateWasmOutput(io, allocator, timer, output_path)) |failure| return failure;
+
+    var wasm = setupGlueRuntimeWasm(io, allocator, output_path) catch |err|
+        return customFailure(allocator, timer, "failed to load the Tasks wasm module: {}", .{err});
+    defer wasm.deinit();
+    const configure = wasm.module_instance.getFunctionHandle("wasm_configure") catch |err|
+        return customFailure(allocator, timer, "the Tasks wasm module has no wasm_configure: {}", .{err});
+
+    const url = "https://example.com/concurrency/tasks";
+    const runs = [_]struct { mode: i32, pause: i32, expected: []const u8 }{
+        .{ .mode = 0, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 2\n" },
+        .{ .mode = 1, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 0\n" },
+        .{ .mode = 2, .pause = 1, .expected = "cancelled at pause 1\nfetches: 1, pauses: 1\n" },
+        .{ .mode = 2, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
+        .{ .mode = 3, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
+    };
+    for (runs) |run| {
+        var params = [_]bytebox.Val{ .{ .I32 = run.mode }, .{ .I32 = run.pause } };
+        var returns: [0]bytebox.Val = undefined;
+        _ = wasm.module_instance.invoke(configure, &params, &returns, .{}) catch |err|
+            return customFailure(allocator, timer, "wasm_configure({d}, {d}) failed: {}", .{ run.mode, run.pause, err });
+        const result = callGlueRuntimeWasmMain(&wasm, allocator) catch |err|
+            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) failed: {}", .{ run.mode, run.pause, err });
+        if (!std.mem.eql(u8, result, run.expected)) {
+            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) reported \"{s}\", expected \"{s}\"", .{ run.mode, run.pause, result, run.expected });
+        }
+        const outstanding = wasmOutstandingAllocations(&wasm) catch |err|
+            return customFailure(allocator, timer, "failed to read the Tasks module's allocation counts: {}", .{err});
+        if (outstanding != 0) {
+            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) left {d} allocations outstanding", .{ run.mode, run.pause, outstanding });
+        }
     }
     return null;
 }

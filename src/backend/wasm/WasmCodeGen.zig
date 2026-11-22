@@ -6520,13 +6520,19 @@ pub fn compileAllProcSpecs(self: *Self, proc_specs: []const LirProcSpec) Allocat
 /// Define `roc_task_cancel(task)`, once, when the program imports the
 /// host's `roc_task_abort`: a call to the builtin `task_cancel` with the
 /// abort's table slot (design.md "Backends"). No body calls it, so it is
-/// made after the bodies; a final module exports it.
+/// made after the bodies. Its symbol is global under its own name, so a
+/// relocatable object keeps it public for the host's link, and a final
+/// module exports it.
 fn compileTaskCancel(self: *Self) Allocator.Error!void {
     const abort = self.task_abort orelse return;
     if (self.task_cancel != null) return;
     const type_idx = try self.internFuncType(&.{.i32}, &.{});
     const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
-    _ = try self.addOwnedLocalFunctionSymbol(defined, "roc_task_cancel", 0);
+    _ = try self.addTrackedDefinedFunctionSymbol(defined, builtins.shim_symbols.roc_task_cancel, 0);
+    // A relocatable object names the abort's slot by its symbol.
+    if (!self.function_symbols_by_index.contains(abort.func_idx)) {
+        try self.recordFunctionSymbol(abort.func_idx, abort.symbol);
+    }
     const abort_slot = self.module.addTableElement(abort.func_idx) catch return error.OutOfMemory;
     self.task_cancel = defined;
     const saved = self.saveState() catch return error.OutOfMemory;
@@ -6540,7 +6546,7 @@ fn compileTaskCancel(self: *Self) Allocator.Error!void {
     self.current_proc_id = null;
     const task = (try self.allocAnonymousLocals(.i32, 1))[0];
     try self.emitLocalGet(task);
-    try self.emitI32Const(@intCast(abort_slot));
+    try self.emitFunctionTableIndexConst(abort_slot);
     try self.emitBuiltinCall(.task_cancel);
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     try self.encodeLocalsDecl(&self.currentBody().preamble, 1);

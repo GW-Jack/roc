@@ -34038,8 +34038,23 @@ backend in the same change. The dev backend and LLVM come first, then
 wasm. The wasm runner is bytebox, and its host keeps the strings it passes
 and receives in the module's memory. A wasm host cancels a task through the
 module's own `roc_task_cancel` (Cancelling), so wasm's end-to-end runs cancel
-at each pause as the others do. The CLI still rejects a wasm target until
-its wasm link exports the task calls.
+at each pause as the others do.
+
+The CLI builds a `Tasks` program for wasm32 on every backend, as a sealed
+relocatable object that the platform's `host.wasm` links against:
+- the object's public definitions add the task calls the host's code calls
+  (`roc_task_resume`, `roc_task_wake` and `roc_task_free` from the merged
+  builtins, and the program's `roc_task_cancel`), and its allowed imports
+  add `roc_task_abort`, which the host defines;
+- in a relocatable object, `roc_task_cancel` is a global symbol under its
+  own name, and it names `roc_task_abort`'s table slot by a
+  `table_index_rel_sleb` relocation against the import's symbol, as any
+  function whose address the object takes.
+
+The concurrency-tasks fixture's wasm32 host (`wasm_host.zig`) runs the
+native host's loop inside the module, and the CLI suite runs it in bytebox
+on dev, speed and size: pausing, answering at once, and cancelling parked
+and woken tasks, each with balanced allocations.
 
 ### What Implements It First
 

@@ -2214,9 +2214,9 @@ fn requirePlatformTargets(ctx: *CliCtx, build_env: *const BuildEnv, app_path: []
 
 /// Reject a platform whose `concurrency` mode the chosen optimization level
 /// and lowering strategy do not support yet (design.md "What Implements It
-/// First"): `Tasks` runs under `.lss` on the interpreter, and on the dev
-/// backend and LLVM for a native `target`. Discovery read the mode from the platform header, so this
-/// runs before any lowering.
+/// First"): `Tasks` runs under `.lss` on every backend, for every target.
+/// Discovery read the mode from the platform header, so this runs before
+/// any lowering.
 /// `ParallelTasks` is left to checking, which reports it as not yet
 /// implemented.
 fn requireSupportedConcurrency(
@@ -2224,14 +2224,13 @@ fn requireSupportedConcurrency(
     build_env: *const BuildEnv,
     opt: cli_args.OptLevel,
     strategy: base.SpecializationStrategy,
-    target: ?RocTarget,
 ) CliMainError!void {
     const mode = build_env.getPlatformConcurrencyMode() orelse return;
     switch (mode) {
         .none, .parallel_tasks => return,
         .tasks => {},
     }
-    if (tasksLowers(opt, strategy, target)) return;
+    if (tasksLowers(strategy)) return;
     try renderProblem(ctx, .{ .unsupported_concurrency_lowering = .{
         .mode = "Tasks",
         .opt = @tagName(opt),
@@ -2243,30 +2242,17 @@ fn requireSupportedConcurrency(
     return error.PlatformNotSupported;
 }
 
-/// Whether a `concurrency: Tasks` program lowers with `opt` under `strategy`
-/// for `target` (null: this host). The continuation pass needs lambda-set
-/// specialization; the interpreter, the dev backend and LLVM implement the
-/// task runtime (design.md "Backends"), dev and LLVM for native targets only
-/// so far.
-fn tasksLowers(opt: cli_args.OptLevel, strategy: base.SpecializationStrategy, target: ?RocTarget) bool {
-    if (strategy != .lss) return false;
-    return switch (opt) {
-        .interpreter => true,
-        .dev, .speed, .size => if (target) |t| t.toCpuArch() != .wasm32 else true,
-    };
+/// Whether a `concurrency: Tasks` program lowers under `strategy`. The
+/// continuation pass needs lambda-set specialization; the interpreter, the
+/// dev backend, LLVM and wasm implement the task runtime (design.md
+/// "Backends").
+fn tasksLowers(strategy: base.SpecializationStrategy) bool {
+    return strategy == .lss;
 }
 
-test "Tasks lowers with specialization on the interpreter, and on dev and LLVM for native targets" {
-    try std.testing.expect(tasksLowers(.interpreter, .lss, null));
-    try std.testing.expect(tasksLowers(.speed, .lss, .arm64mac));
-    try std.testing.expect(tasksLowers(.size, .lss, null));
-    try std.testing.expect(!tasksLowers(.speed, .lss, .wasm32));
-    try std.testing.expect(!tasksLowers(.speed, .boxy, null));
-    try std.testing.expect(!tasksLowers(.interpreter, .boxy, null));
-    try std.testing.expect(tasksLowers(.dev, .lss, null));
-    try std.testing.expect(tasksLowers(.dev, .lss, .x64musl));
-    try std.testing.expect(!tasksLowers(.dev, .lss, .wasm32));
-    try std.testing.expect(!tasksLowers(.dev, .boxy, null));
+test "Tasks lowers only with lambda-set specialization" {
+    try std.testing.expect(tasksLowers(.lss));
+    try std.testing.expect(!tasksLowers(.boxy));
 }
 
 /// The host inputs a shim run links for its selected target, copied out of
@@ -2810,7 +2796,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
 
         const platform = try requirePlatformTargets(ctx, &build_env, args.path);
         const selected = try selectRunPlatformTarget(ctx, platform.config, platform.root_file, args.target);
-        try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt), selected.target);
+        try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
         build_env.setTarget(selected.target);
         build_env.setValidateTargetFilesForSelectedTarget(true);
 
@@ -8745,10 +8731,38 @@ fn wasmRocHostRequirements(
     store: *const lir.LirStore,
 ) std.mem.Allocator.Error![]const []const u8 {
     const hosted = try hostedSymbolsFromLir(arena, store);
-    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len);
+    // A `Tasks` program's `roc_task_cancel` calls the host's
+    // `roc_task_abort` (design.md "Host Contract").
+    const task_abort: []const []const u8 = if (store.createsTask()) &.{shim_symbols.roc_task_abort} else &.{};
+    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_abort.len);
     @memcpy(requirements[0..hosted.len], hosted);
-    @memcpy(requirements[hosted.len..], &host_symbols.runtime_symbols);
+    @memcpy(requirements[hosted.len..][0..host_symbols.runtime_symbols.len], &host_symbols.runtime_symbols);
+    @memcpy(requirements[hosted.len + host_symbols.runtime_symbols.len ..], task_abort);
     return requirements;
+}
+
+/// The public definitions of a sealed wasm app object: its entrypoints and
+/// exported static data, and, for a `Tasks` program, the task calls the
+/// host's code calls (design.md "Host Contract"), which the object defines
+/// (the merged builtins' three and the program's `roc_task_cancel`).
+fn wasmAppExports(
+    ctx: *CliCtx,
+    store: *const lir.LirStore,
+    entrypoints: []const backend.Entrypoint,
+    static_data_exports: []const backend.StaticDataExport,
+) Allocator.Error![]const []const u8 {
+    const app = try sharedLibraryAppExports(ctx, entrypoints, static_data_exports);
+    if (!store.createsTask()) return app;
+    const task_calls = [_][]const u8{
+        shim_symbols.roc_task_resume,
+        shim_symbols.roc_task_wake,
+        shim_symbols.roc_task_free,
+        shim_symbols.roc_task_cancel,
+    };
+    const symbols = try ctx.arena.alloc([]const u8, app.len + task_calls.len);
+    @memcpy(symbols[0..app.len], app);
+    @memcpy(symbols[app.len..], &task_calls);
+    return symbols;
 }
 
 fn hostedSymbolsFromLirDispatch(arena: std.mem.Allocator, store: *const lir.LirStore) std.mem.Allocator.Error![]const []const u8 {
@@ -9290,7 +9304,7 @@ fn writeDevWasmObject(
         artifact_dir,
         "roc_app_wasm32.o",
         &codegen.module,
-        try sharedLibraryAppExports(ctx, entrypoints, static_data_exports),
+        try wasmAppExports(ctx, &lowered.lir_result.store, entrypoints, static_data_exports),
         pack_imports.items,
         stack_checks,
         timing,
@@ -10146,7 +10160,7 @@ fn writeCombinedLlvmWasmObject(
         artifact_dir,
         obj_filename,
         &wasm_module,
-        try sharedLibraryAppExports(ctx, entrypoints, static_data_exports),
+        try wasmAppExports(ctx, &lir_result.store, entrypoints, static_data_exports),
         try wasmRocHostRequirements(ctx.arena, &lir_result.store),
         stack_checks,
         null,
@@ -10395,7 +10409,7 @@ fn resolveBuildCommandPlatform(
         try selectRunPlatformTarget(ctx, targets_config, platform_source, args.target)
     else
         try selectBuildPlatformTarget(ctx, targets_config, platform_source, args.target);
-    try requireSupportedConcurrency(ctx, build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt), selected.target);
+    try requireSupportedConcurrency(ctx, build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
     return .{ platform_dir, selected };
 }
 
@@ -17363,7 +17377,7 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) CliMainEr
     };
     reporter.end();
     // `roc test` runs on this host.
-    try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt), null);
+    try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
 
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {

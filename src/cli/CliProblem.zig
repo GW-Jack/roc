@@ -1184,15 +1184,9 @@ fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytyp
     try report.document.addAnnotated("concurrency: Tasks", .emphasized);
     try report.document.addText(" needs lambda-set specialization (");
     try report.document.addAnnotated("--specialize=yes", .emphasized);
-    try report.document.addText(") on the interpreter (");
-    try report.document.addAnnotated("--opt=interpreter", .emphasized);
-    try report.document.addText(") or, for a native target, on the dev backend (");
-    try report.document.addAnnotated("--opt=dev", .emphasized);
-    try report.document.addText(") or LLVM (");
-    try report.document.addAnnotated("--opt=speed", .emphasized);
-    try report.document.addText(" or ");
-    try report.document.addAnnotated("--opt=size", .emphasized);
-    try report.document.addText(").");
+    try report.document.addText("), with any ");
+    try report.document.addAnnotated("--opt", .emphasized);
+    try report.document.addText(" and target.");
 
     return report;
 }
@@ -1858,7 +1852,7 @@ test "unsupported_opt_level generates correct report" {
     try std.testing.expectEqual(Severity.fatal, report.severity);
 }
 
-test "unsupported_concurrency_lowering names the supported options" {
+test "unsupported_concurrency_lowering names the option it needs" {
     const rendered = try renderPlainForTest(.{ .unsupported_concurrency_lowering = .{
         .mode = "Tasks",
         .opt = "speed",
@@ -1866,7 +1860,7 @@ test "unsupported_concurrency_lowering names the supported options" {
     } });
     defer std.testing.allocator.free(rendered);
     // The report wraps its lines, so each needle fits within one.
-    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=speed --specialize=no", "--specialize=yes", "--opt=interpreter", "--opt=dev", "--opt=size" }) |needle| {
+    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=speed --specialize=no", "--specialize=yes" }) |needle| {
         try std.testing.expect(std.mem.find(u8, rendered, needle) != null);
     }
 }

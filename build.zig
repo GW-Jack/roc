@@ -1789,6 +1789,15 @@ fn setupTestPlatforms(
     });
     prepared_hosts_step.dependOn(wasm_host_step);
     prepared_hosts_step.dependOn(wasm_v1_host_step);
+    // The `concurrency: Tasks` test platform's wasm32 host drives its task
+    // inside the module.
+    prepared_hosts_step.dependOn(buildAndCopyWasmHostObject(b, wasm_target, optimize, strip, omit_frame_pointer, .{
+        .name = "host",
+        .root_source_file = "test/concurrency-tasks/platform/wasm_host.zig",
+        .imports = test_host_imports,
+        .bundle_compiler_rt = true,
+        .dest_paths = &.{"test/concurrency-tasks/platform/targets/wasm32/host.wasm"},
+    }));
     const host_alloc_imports: []const std.Build.Module.Import = &.{
         .{ .name = "host_alloc", .module = roc_modules.host_alloc },
     };
