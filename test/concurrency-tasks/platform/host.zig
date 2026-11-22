@@ -104,8 +104,20 @@ fn hostedFetch(task: *RocTask, out: *RocStr, url: RocStr) callconv(.c) u32 {
     return poll_pending;
 }
 
+/// `void roc_task_abort(RocTask *task)`, which every `Tasks` host defines
+/// (design.md "Host Contract"): abandon the fetch the cancelled task is
+/// parked on, releasing its URL.
+fn taskAbort(task: *RocTask) callconv(.c) void {
+    const pending = g_pending orelse @panic("roc_task_abort with no fetch pending");
+    std.debug.assert(pending.task == task);
+    g_pending = null;
+    var url = pending.url;
+    url.decref(&g_roc_ops);
+}
+
 comptime {
     @export(&hostedFetch, .{ .name = "roc_host_fetch", .visibility = .hidden });
+    @export(&taskAbort, .{ .name = builtins.shim_symbols.roc_task_abort, .visibility = .hidden });
     host_alloc.exportRuntimeSymbols(getOps, .{});
 }
 

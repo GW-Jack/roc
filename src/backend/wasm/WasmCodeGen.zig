@@ -382,6 +382,12 @@ tail_drivers: std.ArrayList(TailDriver) = .empty,
 /// names as its slot release, by the helper's atomic cache key, registered
 /// with its table slot before any body is generated (design.md "Backends").
 slot_drop_adapters: std.AutoArrayHashMapUnmanaged(u64, SlotDropAdapter) = .empty,
+/// The host's `roc_task_abort`, imported when the program creates a task
+/// (design.md "Backends").
+task_abort: ?HostedSymbolTarget = null,
+/// The program's `roc_task_cancel`, defined after the procedure bodies when
+/// it imports `roc_task_abort`.
+task_cancel: ?index_types.DefinedFunction = null,
 /// Where the current proc keeps its return value until epilogue time: a wasm
 /// local, or in split mode a frame slot every function of the family reads.
 proc_return: Storage.LocalInfo = .{ .idx = 0, .val_type = .i32 },
@@ -2050,6 +2056,7 @@ fn finishFinalModule(self: *Self) Allocator.Error![]u8 {
         const hosted_proc = spec.hosted.get() orelse continue;
         try hosted.append(self.allocator, self.store.getString(hosted_proc.symbol));
     }
+    if (self.task_abort != null) try hosted.append(self.allocator, builtins.shim_symbols.roc_task_abort);
     self.module.verifyNoBuiltinImports(hosted.items) catch {
         wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
     };
@@ -2112,6 +2119,9 @@ pub fn generateEntrypointModule(
     try self.flushPendingBodies();
     for (entrypoints, wrappers) |entry, wrapper| {
         self.module.addExport(entry.symbol_name, .func, wrapper) catch return error.OutOfMemory;
+    }
+    if (self.task_cancel) |cancel| {
+        self.module.addExport(builtins.shim_symbols.roc_task_cancel, .func, cancel.function.raw()) catch return error.OutOfMemory;
     }
     for (runtime_exports) |name| {
         const symbol = self.module.findDefinedFunctionSymbolExact(name) catch |err| wasmInvariantFmt(
@@ -6504,6 +6514,38 @@ pub fn compileAllProcSpecs(self: *Self, proc_specs: []const LirProcSpec) Allocat
     try self.compileProcBodies(proc_specs);
     try self.compileTailDrivers();
     try self.compileSlotDropAdapters();
+    try self.compileTaskCancel();
+}
+
+/// Define `roc_task_cancel(task)`, once, when the program imports the
+/// host's `roc_task_abort`: a call to the builtin `task_cancel` with the
+/// abort's table slot (design.md "Backends"). No body calls it, so it is
+/// made after the bodies; a final module exports it.
+fn compileTaskCancel(self: *Self) Allocator.Error!void {
+    const abort = self.task_abort orelse return;
+    if (self.task_cancel != null) return;
+    const type_idx = try self.internFuncType(&.{.i32}, &.{});
+    const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
+    _ = try self.addOwnedLocalFunctionSymbol(defined, "roc_task_cancel", 0);
+    const abort_slot = self.module.addTableElement(abort.func_idx) catch return error.OutOfMemory;
+    self.task_cancel = defined;
+    const saved = self.saveState() catch return error.OutOfMemory;
+    errdefer self.abandonState(saved);
+    try self.beginFunction(defined.local);
+    self.stack_frame_size = 0;
+    self.uses_stack_memory = false;
+    self.fp_local = 0;
+    self.cf_depth = 0;
+    self.in_proc = false;
+    self.current_proc_id = null;
+    const task = (try self.allocAnonymousLocals(.i32, 1))[0];
+    try self.emitLocalGet(task);
+    try self.emitI32Const(@intCast(abort_slot));
+    try self.emitBuiltinCall(.task_cancel);
+    self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+    try self.encodeLocalsDecl(&self.currentBody().preamble, 1);
+    self.endFunction();
+    self.restoreState(saved);
 }
 
 /// A slot-release adapter: its function, its table slot, and the RC helper
@@ -7876,6 +7918,19 @@ pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcS
             .symbol = imported.symbol,
         });
     }
+    if (self.task_abort == null and self.createsTask()) {
+        self.task_abort = try self.resolveSymbolTarget(builtins.shim_symbols.roc_task_abort, &.{.i32}, &.{});
+    }
+}
+
+/// Whether the program creates a task, and so is a `Tasks` program that
+/// defines `roc_task_cancel` over the host's `roc_task_abort`.
+fn createsTask(self: *const Self) bool {
+    for (self.store.getCFStmts()) |stmt| {
+        if (stmt != .assign_low_level) continue;
+        if (stmt.assign_low_level.op == .task_create) return true;
+    }
+    return false;
 }
 
 /// The wasm C-ABI signature of a procedure called through the platform C

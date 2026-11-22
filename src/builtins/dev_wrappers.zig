@@ -1435,6 +1435,13 @@ pub fn roc_builtins_task_free(roc_task: *task.RocTask) callconv(.c) void {
     task.host_calls.free(roc_task);
 }
 
+/// `roc_task_cancel`'s body, with the host's `roc_task_abort` as `abort`: a
+/// `Tasks` program defines `roc_task_cancel` as a call to this (design.md
+/// "Backends").
+pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn) callconv(.c) void {
+    roc_task.cancel(abort);
+}
+
 /// Enter the loaded dev-shim code image that contains the generated callsite.
 pub fn roc_builtins_hot_reload_enter() callconv(.c) ?*anyopaque {
     if (comptime @hasDecl(@import("root"), "roc_hot_reload_enter")) {

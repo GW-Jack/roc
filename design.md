@@ -33890,9 +33890,11 @@ The builtins object exports `roc_task_resume`, `roc_task_wake` and
 `roc_task_free` (`RocTask.host_calls`). Each program binary defines them
 exactly once, since a second definition collides in the link: the
 interpreter shim gets them by bundling that object, and the machine-code
-shim, which links no builtins object, defines them itself (Backends). `roc_task_cancel` comes with the host
-ABI, since it calls the host's `roc_task_abort`, which a host that does not
-opt in never defines.
+shim, which links no builtins object, defines them itself (Backends).
+`roc_task_cancel` calls the host's `roc_task_abort`, which only the host of
+a `Tasks` platform defines. So a `Tasks` program defines `roc_task_cancel`
+itself rather than getting it from the builtins object, and a program of
+another mode neither defines it nor refers to `roc_task_abort` (Backends).
 
 The host resumes a root once after creating it and once for each
 `roc_task_ready`, never from inside a hosted call or another resume. These
@@ -33985,6 +33987,17 @@ byte:
   machine-code shim the host links defines the three calls instead. The
   runtime keeps nothing outside the task that a second copy would split, so the shim's copy and the
   image's agree on every task.
+- **Cancelling.** `roc_task_cancel(task)` calls the registry builtin
+  `roc_builtins_task_cancel(task, abort)`, `callconv(.c)`, with the host's
+  `roc_task_abort` as `abort`; the builtin is `RocTask.cancel`. A `Tasks`
+  program defines it where the program's own symbols live:
+  - LLVM, in the program's module, beside the other three calls;
+  - wasm, in the final module, which imports `roc_task_abort` from `env`
+    like a hosted function, puts it in the table, and exports
+    `roc_task_cancel`;
+  - a shim build (the interpreter's, or the dev backend's run image), in the
+    generated platform shim module, which the CLI generates knowing the
+    platform's mode.
 - **Wasm.** Wasm checks the type of every indirect call, so nothing may
   stand in for a function of another signature:
   - each `slot_drop` helper gets its own adapter of the `fn(slot, record,
@@ -34013,10 +34026,10 @@ hosted-call trace and leak check match the interpreter's, including a
 cancel at each pause. The CLI stops rejecting `concurrency: Tasks` for that
 backend in the same change. The dev backend and LLVM come first, then
 wasm. The wasm runner is bytebox, and its host keeps the strings it passes
-and receives in the module's memory. A wasm host can cancel a task only
-through `roc_task_cancel`, which comes with the host ABI (Host Contract), so
-until then wasm's end-to-end runs pause and finish but do not cancel, and
-the CLI still rejects a wasm target.
+and receives in the module's memory. A wasm host cancels a task through the
+module's own `roc_task_cancel` (Cancelling), so wasm's end-to-end runs cancel
+at each pause as the others do. The CLI still rejects a wasm target until
+its wasm link exports the task calls.
 
 ### What Implements It First
 

@@ -32,6 +32,10 @@ pub const Entry = extern struct {
     slot_drop: ?SlotDropFn,
 };
 
+/// The host's `roc_task_abort`: abandon the operation a cancelled task is
+/// parked on (design.md "Host Contract").
+pub const AbortFn = *const fn (*RocTask) callconv(.c) void;
+
 /// The sizes and alignments of a task's two buffers, which the continuation
 /// pass records as program constants.
 pub const BufferLayout = struct {
@@ -182,7 +186,7 @@ pub const RocTask = extern struct {
     /// `roc_task_cancel`: abandon the parked task's operation with `abort`
     /// unless the host already finished it, then release the hosted result
     /// the host wrote and every record.
-    pub fn cancel(self: *RocTask, abort: *const fn (*RocTask) callconv(.c) void) void {
+    pub fn cancel(self: *RocTask, abort: AbortFn) void {
         if (self.status != .pending or self.pending == 0) utils.builtinInvariant(self.ops, "a task was cancelled while not parked");
         if (self.woken) {
             const innermost = self.entries[self.len - 1];

@@ -73,6 +73,11 @@ const Run = struct {
         self.runtime.deinit();
     }
 
+    /// The interpreter's program defines no `roc_task_cancel`.
+    fn cancelFn(_: Program) task_test_host.CancelFn {
+        return &task_test_host.nativeCancel;
+    }
+
     /// Make the root's task by calling the program's root, the task entry
     /// `E(url, result_out)` the continuation pass put in the root's place
     /// (design.md "Host Contract"): it creates the task, whose result goes
@@ -106,8 +111,10 @@ const LlvmProgram = struct {
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     static_data: []static_data.StaticDataExport,
     image: eval.InspectedRun.LlvmImage,
+    /// The program's `roc_task_cancel`.
+    cancel: task_test_host.CancelFn,
 
-    fn init(self: *LlvmProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) eval.InspectedRun.LlvmError!void {
+    fn init(self: *LlvmProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) (eval.InspectedRun.LlvmError || error{MissingTaskCancel})!void {
         self.lowered = lowered;
         self.static_data = try harness.nativeStaticData(lowered);
         errdefer harness.freeNativeStaticData(self.static_data);
@@ -120,6 +127,10 @@ const LlvmProgram = struct {
             .static_data = self.static_data,
             .static_data_value_count = program.static_data_values.items.len,
         }, .{ .resolve = task_test_host.resolveCAbiSymbol });
+        self.cancel = self.image.lib.lookup(task_test_host.CancelFn, builtins.shim_symbols.roc_task_cancel) orelse {
+            self.image.deinit();
+            return error.MissingTaskCancel;
+        };
     }
 
     fn deinit(self: *LlvmProgram) void {
@@ -152,6 +163,12 @@ const LlvmRun = struct {
         builtins.in_process_host.leave(self.entered);
         self.host.deinit();
         self.runtime.deinit();
+    }
+
+    /// The program's own `roc_task_cancel`, which cancels with the test
+    /// host's `roc_task_abort`.
+    fn cancelFn(program: Program) task_test_host.CancelFn {
+        return program.cancel;
     }
 
     /// Make the root's task by calling the compiled task entry
@@ -231,6 +248,12 @@ const DevRun = struct {
         self.runtime.deinit();
     }
 
+    /// A dev image defines no `roc_task_cancel`: a dev shim build's comes
+    /// with its generated platform shim (design.md "Backends").
+    fn cancelFn(_: Program) task_test_host.CancelFn {
+        return &task_test_host.nativeCancel;
+    }
+
     /// Make the root's task by calling the compiled task entry
     /// `E(url, result_out)` through its entrypoint wrapper.
     fn startRoot(self: *DevRun, program: Program, result: *RocStr) E2eError!*RocTask {
@@ -299,16 +322,19 @@ const WasmRun = struct {
     /// The paused operation: the task, its result slot, and its URL.
     pending: ?struct { task: u32, out: u32, url: [wasm_str_size]u8 } = null,
     pauses: u32 = 0,
+    /// How many paused operations a cancel abandoned.
+    aborts: u32 = 0,
     /// The first error a hosted call hit, which it cannot return.
     failure: ?E2eError = null,
 
     fn init(self: *WasmRun, program: Program, mode: task_test_host.Mode) E2eError!void {
         self.* = .{ .session = undefined, .mode = mode };
         const fetch_params = [_]wasm_runner.ValType{ .I32, .I32, .I32 };
-        const log_params = [_]wasm_runner.ValType{.I32};
+        const task_params = [_]wasm_runner.ValType{.I32};
         self.session.init(std.testing.allocator, program.module.wasm_bytes, program.module.heap_base, &.{
             .{ .name = "roc_host_fetch", .params = &fetch_params, .results = &.{.I32}, .callback = fetch, .context = self },
-            .{ .name = "roc_host_log", .params = &log_params, .results = &.{}, .callback = log, .context = self },
+            .{ .name = "roc_host_log", .params = &task_params, .results = &.{}, .callback = log, .context = self },
+            .{ .name = builtins.shim_symbols.roc_task_abort, .params = &task_params, .results = &.{}, .callback = abort, .context = self },
         }) catch return error.TestUnexpectedResult;
     }
 
@@ -345,9 +371,14 @@ const WasmRun = struct {
 
     /// Release the `Str` at `at`, as `RocStr.decref` does.
     fn decrefStr(self: *WasmRun, at: u32) void {
-        if (self.mem()[at + wasm_str_size - 1] & builtins.str.RocStr.small_str_flag != 0) return;
-        const cap = self.readWord(at + 4);
-        const alloc = if (cap & wasm_slice_tag != 0) cap & ~@as(u32, wasm_slice_tag) else self.readWord(at);
+        self.decrefStrValue(self.mem()[at..][0..wasm_str_size].*);
+    }
+
+    /// Release the `Str` whose bytes are `str`.
+    fn decrefStrValue(self: *WasmRun, str: [wasm_str_size]u8) void {
+        if (str[wasm_str_size - 1] & builtins.str.RocStr.small_str_flag != 0) return;
+        const cap = std.mem.readInt(u32, str[4..8], .little);
+        const alloc = if (cap & wasm_slice_tag != 0) cap & ~@as(u32, wasm_slice_tag) else std.mem.readInt(u32, str[0..4], .little);
         const count = self.readWord(alloc - 4);
         switch (count) {
             0 => {},
@@ -412,6 +443,22 @@ const WasmRun = struct {
         self.decrefStr(text);
     }
 
+    /// `void roc_task_abort(RocTask *task)`: abandon the paused operation.
+    fn abort(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const wasm_runner.Val, _: [*]wasm_runner.Val) error{}!void {
+        const self: *WasmRun = @ptrCast(@alignCast(context));
+        const pending = self.pending orelse {
+            if (self.failure == null) self.failure = error.TestUnexpectedResult;
+            return;
+        };
+        if (pending.task != @as(u32, @bitCast(params[0].I32))) {
+            if (self.failure == null) self.failure = error.TestUnexpectedResult;
+            return;
+        }
+        self.pending = null;
+        self.aborts += 1;
+        self.decrefStrValue(pending.url);
+    }
+
     fn call(self: *WasmRun, name: []const u8, task: u32, returns: []wasm_runner.Val) E2eError!void {
         self.session.invoke(name, &.{.{ .I32 = @bitCast(task) }}, returns) catch return error.TestUnexpectedResult;
         if (self.failure) |err| return err;
@@ -431,8 +478,8 @@ const WasmRun = struct {
         const url_addr = self.session.alloc(4, wasm_str_size);
         self.mem()[url_addr..][0..wasm_str_size].* = pending.url;
         try self.answer(url_addr, pending.out);
-        self.decrefStr(url_addr);
         self.session.free();
+        self.decrefStrValue(pending.url);
         try self.call(builtins.shim_symbols.roc_task_wake, pending.task, &.{});
     }
 
@@ -445,31 +492,58 @@ const WasmRun = struct {
         }
         return status;
     }
+
+    /// Run the task until its `pause`th pause, then cancel it there with
+    /// the program's `roc_task_cancel`, as `TestHost.driveAndCancel` does.
+    /// Returns whether it reached that pause.
+    fn driveAndCancel(self: *WasmRun, task: u32, pause: u32, woken: bool) E2eError!bool {
+        var status = try self.resumeTask(task);
+        var seen: u32 = 0;
+        while (status == .pending) {
+            seen += 1;
+            if (seen == pause) {
+                if (woken) try self.finish();
+                try self.call(builtins.shim_symbols.roc_task_cancel, task, &.{});
+                return true;
+            }
+            try self.finish();
+            status = try self.resumeTask(task);
+        }
+        return false;
+    }
+
+    /// Call the task entry with the URL and the root result's storage, both
+    /// in memory the host owns, and return the task.
+    fn startRoot(self: *WasmRun, program: *const WasmProgram, result: u32) E2eError!u32 {
+        const store = &program.lowered.lir_result.store;
+        const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
+        const url_addr = self.session.alloc(4, wasm_str_size);
+        self.newStr(url, url_addr);
+        var task: [1]wasm_runner.Val = undefined;
+        self.session.invoke(wasm_entry, &.{ .{ .I32 = @bitCast(url_addr) }, .{ .I32 = @bitCast(result) } }, &task) catch return error.TestUnexpectedResult;
+        if (self.failure) |err| return err;
+        // A borrowed argument stays the caller's.
+        if ((entry.rc_borrowed_params & 1) != 0) self.decrefStr(url_addr);
+        self.session.free();
+        return @bitCast(task[0].I32);
+    }
+
+    /// Storage for the root's result, which the host owns.
+    fn resultStorage(self: *WasmRun) u32 {
+        const result = self.session.alloc(4, wasm_str_size);
+        @memset(self.mem()[result..][0..wasm_str_size], 0);
+        return result;
+    }
 };
 
 /// Run the wasm-compiled program to its end with a host in `mode`: the same
 /// result, trace, and pauses as the interpreter's, and nothing live after.
-/// Cancelling a parked task needs `roc_task_cancel`, which joins the host
-/// ABI with `roc_task_abort` (design.md "Host Contract"), so the wasm runs
-/// do not cancel.
 fn runToEndWasm(program: *const WasmProgram, mode: task_test_host.Mode) E2eError!void {
     var run: WasmRun = undefined;
     try run.init(program, mode);
     defer run.deinit();
-    const store = &program.lowered.lir_result.store;
-    const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
-    // The host's own memory for the URL argument and the root's result.
-    const url_addr = run.session.alloc(4, wasm_str_size);
-    const result = run.session.alloc(4, wasm_str_size);
-    @memset(run.mem()[result..][0..wasm_str_size], 0);
-    run.newStr(url, url_addr);
-    var task: [1]wasm_runner.Val = undefined;
-    run.session.invoke(wasm_entry, &.{ .{ .I32 = @bitCast(url_addr) }, .{ .I32 = @bitCast(result) } }, &task) catch return error.TestUnexpectedResult;
-    if (run.failure) |err| return err;
-    // A borrowed argument stays the caller's.
-    if ((entry.rc_borrowed_params & 1) != 0) run.decrefStr(url_addr);
-    run.session.free();
-    const task_addr: u32 = @bitCast(task[0].I32);
+    const result = run.resultStorage();
+    const task_addr = try run.startRoot(program, result);
     try std.testing.expectEqual(builtins.task.Status.done, try run.drive(task_addr));
     try run.call(builtins.shim_symbols.roc_task_free, task_addr, &.{});
     const got = wasm_runner.readWasmStr(run.mem(), result) catch return error.TestUnexpectedResult;
@@ -479,6 +553,23 @@ fn runToEndWasm(program: *const WasmProgram, mode: task_test_host.Mode) E2eError
     try std.testing.expectEqual(expected_trace.len, run.trace.items.len);
     for (expected_trace, run.trace.items) |want, got_entry| try std.testing.expectEqualStrings(want, got_entry);
     try std.testing.expectEqual(@as(u32, if (mode == .pause) pause_count else 0), run.pauses);
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
+/// Cancel the wasm-compiled program's task at its `pause`th pause through
+/// the module's `roc_task_cancel`, before or after the host finishes the
+/// operation: the host's `roc_task_abort` runs only before, and nothing is
+/// live after. Freeing the task succeeds only after it was cancelled.
+fn cancelAtWasm(program: *const WasmProgram, pause: u32, woken: bool) E2eError!void {
+    var run: WasmRun = undefined;
+    try run.init(program, .pause);
+    defer run.deinit();
+    const result = run.resultStorage();
+    const task = try run.startRoot(program, result);
+    try std.testing.expect(try run.driveAndCancel(task, pause, woken));
+    try run.call(builtins.shim_symbols.roc_task_free, task, &.{});
+    run.session.free();
+    try std.testing.expectEqual(@as(u32, if (woken) 0 else 1), run.aborts);
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
 }
 
@@ -494,6 +585,14 @@ fn runAllWasm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerT
             std.log.err("tasks end-to-end run on wasm ({s}) failed: {s}", .{ @tagName(mode), @errorName(err) });
             return error.TestUnexpectedResult;
         };
+    }
+    for (1..pause_count + 1) |pause| {
+        for ([_]bool{ false, true }) |woken| {
+            cancelAtWasm(&program, @intCast(pause), woken) catch |err| {
+                std.log.err("cancelling the wasm task at pause {d} (woken: {}) failed: {s}", .{ pause, woken, @errorName(err) });
+                return error.TestUnexpectedResult;
+            };
+        }
     }
 }
 
@@ -526,7 +625,7 @@ fn cancelAt(comptime R: type, program: R.Program, pause: u32, woken: bool) E2eEr
     defer run.deinit();
     var result: RocStr = RocStr.empty();
     const task = try run.startRoot(program, &result);
-    try std.testing.expectEqual(builtins.task.Status.cancelled, try run.host.driveAndCancel(task, pause, woken));
+    try std.testing.expectEqual(builtins.task.Status.cancelled, try run.host.driveAndCancel(task, pause, woken, R.cancelFn(program)));
     task.free();
     try std.testing.expectEqual(@as(u32, if (woken) 0 else 1), run.host.aborts);
     try run.runtime.checkForLeaks();
@@ -556,7 +655,7 @@ fn runAllLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerT
     };
     defer program.deinit();
     // A host links its task calls from the program it runs.
-    for ([_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_wake, builtins.shim_symbols.roc_task_free }) |name| {
+    for ([_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_wake, builtins.shim_symbols.roc_task_free, builtins.shim_symbols.roc_task_cancel }) |name| {
         if (program.image.lib.lookup(*const anyopaque, name) == null) {
             std.log.err("the LLVM-compiled Tasks program does not export {s}", .{name});
             return error.TestUnexpectedResult;
@@ -597,6 +696,6 @@ test "a Tasks program compiled by the dev backend pauses and cancels as it does 
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllDev);
 }
 
-test "a Tasks program compiled by the wasm backend pauses as it does on the interpreter, with no leaks" {
+test "a Tasks program compiled by the wasm backend pauses and cancels as it does on the interpreter, with no leaks" {
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
 }

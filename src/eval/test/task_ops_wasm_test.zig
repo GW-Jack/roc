@@ -4,9 +4,8 @@
 //! the same outcomes as the interpreter's, from records compiled code packs
 //! inside wasm memory.
 //!
-//! Cancelling a parked task needs `roc_task_cancel`, which joins the host ABI
-//! with `roc_task_abort` (design.md "Host Contract"), so these programs run
-//! to the end.
+//! A task is cancelled through the module's own `roc_task_cancel`, which
+//! calls the host's `roc_task_abort` (design.md "Backends").
 
 const std = @import("std");
 const builtins = @import("builtins");
@@ -35,6 +34,9 @@ const PausingHost = struct {
     task: u32 = 0,
     slot: u32 = 0,
     x: u64 = 0,
+    /// The task the last `roc_task_abort` was given.
+    aborted: u32 = 0,
+    aborts: u32 = 0,
 
     fn pause(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const Val, results: [*]Val) error{}!void {
         const self: *PausingHost = @ptrCast(@alignCast(context));
@@ -43,6 +45,13 @@ const PausingHost = struct {
         self.slot = @bitCast(params[1].I32);
         self.x = @bitCast(params[2].I64);
         results[0] = .{ .I32 = 1 };
+    }
+
+    /// `void roc_task_abort(RocTask *task)`.
+    fn abort(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const Val, _: [*]Val) error{}!void {
+        const self: *PausingHost = @ptrCast(@alignCast(context));
+        self.aborts += 1;
+        self.aborted = @bitCast(params[0].I32);
     }
 };
 
@@ -68,13 +77,19 @@ const WasmRun = struct {
             objects.boxy_runtime,
         );
         defer f.allocator.free(module.wasm_bytes);
-        try self.session.init(f.allocator, module.wasm_bytes, module.heap_base, &.{.{
+        try self.session.init(f.allocator, module.wasm_bytes, module.heap_base, &.{ .{
             .name = "roc_test_pause",
             .params = &.{ .I32, .I32, .I64 },
             .results = &.{.I32},
             .callback = PausingHost.pause,
             .context = &self.host,
-        }});
+        }, .{
+            .name = shim_symbols.roc_task_abort,
+            .params = &.{.I32},
+            .results = &.{},
+            .callback = PausingHost.abort,
+            .context = &self.host,
+        } });
     }
 
     fn deinit(self: *WasmRun) void {
@@ -178,6 +193,61 @@ test "a task whose hosted result has a slot release resumes and releases that re
     try run.call(shim_symbols.roc_task_wake, task);
     try std.testing.expectEqual(Status.done, try run.resumeTask(task));
     try std.testing.expectEqual(@as(u64, 20), std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
+/// Write a heap wasm32 `Str` holding `text` into `slot`, allocated as Roc
+/// allocates one, with its refcount of one before its bytes.
+fn writeHeapStr(run: *WasmRun, slot: u32, text: []const u8) void {
+    const len: u32 = @intCast(text.len);
+    const data = run.session.alloc(4, 4 + len);
+    const mem = run.session.memory();
+    std.mem.writeInt(u32, mem[data..][0..4], 1, .little);
+    @memcpy(mem[data + 4 ..][0..len], text);
+    std.mem.writeInt(u32, mem[slot..][0..4], data + 4, .little);
+    std.mem.writeInt(u32, mem[slot + 4 ..][0..4], len << builtins.str.RocStr.capacity_shift, .little);
+    std.mem.writeInt(u32, mem[slot + 8 ..][0..4], len, .little);
+}
+
+test "cancelling a woken task releases the hosted result through its slot release on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.pausingProgram(&f, .str, false);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry);
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.start(root);
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+
+    // The host writes a heap string and wakes the task, which is then
+    // cancelled instead of resumed: the record's slot release, the module's
+    // adapter, frees the string, and no abort runs.
+    writeHeapStr(&run, run.host.slot, "a string too long to be small");
+    try run.call(shim_symbols.roc_task_wake, task);
+    try run.call(shim_symbols.roc_task_cancel, task);
+    try std.testing.expectEqual(@as(u32, 0), run.host.aborts);
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
+test "cancelling a task the host has not finished aborts the host call on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.pausingProgram(&f, .str, false);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry);
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.start(root);
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+
+    try run.call(shim_symbols.roc_task_cancel, task);
+    try std.testing.expectEqual(@as(u32, 1), run.host.aborts);
+    try std.testing.expectEqual(task, run.host.aborted);
     try run.call(shim_symbols.roc_task_free, task);
     run.session.free();
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());

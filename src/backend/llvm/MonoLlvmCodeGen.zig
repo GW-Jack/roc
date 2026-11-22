@@ -5456,7 +5456,9 @@ pub const MonoLlvmCodeGen = struct {
     /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_wake` and
     /// `roc_task_free`, each a call to its builtin. Linking the builtins keeps
     /// only what the program defines, so the program defines these for the
-    /// host. Runs after the procs, when no function is mid-emission.
+    /// host. `roc_task_cancel` calls its builtin with the host's
+    /// `roc_task_abort`. Runs after the procs, when no function is
+    /// mid-emission.
     fn defineTaskHostCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
@@ -5480,6 +5482,17 @@ pub const MonoLlvmCodeGen = struct {
             }
             wip.finish() catch return error.OutOfMemory;
         }
+
+        const cancel = try self.declareBuiltin(.task_cancel, .void, &.{ ptr_ty, ptr_ty });
+        const abort_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
+        const abort = try self.declareHostSymbol(builtins.shim_symbols.roc_task_abort, abort_ty);
+        const func = builder.addFunction(abort_ty, builder.strtabString(builtins.shim_symbols.roc_task_cancel) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
+        var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
+        defer wip.deinit();
+        wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
+        _ = wip.call(.normal, .ccc, .none, cancel.typeOf(builder), cancel.toValue(builder), &.{ wip.arg(0), abort.toValue(builder) }, "") catch return error.OutOfMemory;
+        _ = wip.retVoid() catch return error.OutOfMemory;
+        wip.finish() catch return error.OutOfMemory;
     }
 
     /// The adapter `suspend_save` hands the task runtime for a hosted result

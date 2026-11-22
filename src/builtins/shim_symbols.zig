@@ -34,6 +34,11 @@ pub const roc_task_resume = "roc_task_resume";
 pub const roc_task_wake = "roc_task_wake";
 /// Frees a task after it finished or was cancelled.
 pub const roc_task_free = "roc_task_free";
+/// Cancels a parked task; a `Tasks` program defines it (design.md "Host
+/// Contract").
+pub const roc_task_cancel = "roc_task_cancel";
+/// The host's: abandon the operation a cancelled task is parked on.
+pub const roc_task_abort = "roc_task_abort";
 /// The hosted dispatch table defined by the generated platform shim module.
 pub const roc_shim_hosted_fns = "roc_shim_hosted_fns";
 /// Number of entries in `roc_shim_hosted_fns`.
