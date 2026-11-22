@@ -3526,6 +3526,20 @@ pub fn build(b: *std.Build) void {
         eval_run_args,
     );
 
+    if (!no_bin and !eval_no_fork) {
+        const cached_eval = b.step("run-test-eval-cached", "Reuse passing eval runs for unchanged filter groups");
+        if (test_filters.len == 0) {
+            addCachedEvalRun(b, eval_test_exe, cached_eval, null);
+        } else {
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(b.allocator);
+            for (test_filters) |filter| {
+                const entry = seen.getOrPut(b.allocator, filter) catch @panic("OOM");
+                if (!entry.found_existing) addCachedEvalRun(b, eval_test_exe, cached_eval, filter);
+            }
+        }
+    }
+
     // `run-test-eval` leaves LLVM evaluation out for speed. This focused run
     // keeps the exact-bit float contract gated on every pull request, so
     // backend drift does not wait for the nightly suite.
@@ -7088,6 +7102,26 @@ fn addBuildPathCheck(b: *std.Build, binary: std.Build.LazyPath) *Step {
     run.addDirectoryArg(b.path("."));
     run.addArg(b.graph.zig_exe);
     return &run.step;
+}
+
+fn addCachedEvalRun(b: *std.Build, exe: *Step.Compile, step: *Step, filter: ?[]const u8) void {
+    const run = b.addRunArtifact(exe);
+    // Use fixed arguments and a declared output. Forwarding positional CLI
+    // arguments would make Zig execute this Run step even on a cache hit.
+    run.addArgs(&.{ "--timeout", "120000" });
+    if (b.graph.host.result.os.tag == .windows) run.addArgs(&.{ "--threads", "1" });
+
+    const report_name = if (filter) |pattern| name: {
+        run.addArgs(&.{ "--filter", pattern });
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        std.crypto.hash.Blake3.hash(pattern, &digest, .{});
+        break :name b.fmt("{s}.json", .{std.fmt.bytesToHex(digest, .lower)});
+    } else "all.json";
+
+    run.addArg("--stats-json");
+    const report = run.addOutputFileArg(report_name);
+    const install_report = b.addInstallFileWithDir(report, .prefix, b.fmt("eval-cache/{s}", .{report_name}));
+    step.dependOn(&install_report.step);
 }
 
 fn install_and_run(

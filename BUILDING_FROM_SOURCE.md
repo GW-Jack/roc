@@ -90,6 +90,19 @@ Runtime filters preserve the compiled test binary and select matching tests:
 zig build run-test-zig-minici -- --test-filter "parseMiniArgs"
 ```
 
+For local eval runs, the opt-in cached target reuses passing results from
+Zig's local cache. Each `-Dtest-filter` pattern is a separate run, so a later
+invocation can reuse individual filter groups. With no filters, the target
+runs the full default eval suite as one group.
+
+```sh
+zig build run-test-eval-cached -Dtest-filter="List.sort" --summary all
+```
+
+Reports are installed under `zig-out/eval-cache/`. A change to the compiled
+runner invalidates its cached results. Use `run-test-eval` to execute the
+tests again. The required MiniCI jobs continue to use `run-test-eval`.
+
 Use repeatable `-Dtest-filter="pattern"` options when the filter should also
 limit test compilation. The build-input identity regression check uses a small
 Debug test binary and checks production/test-only edits at unchanged `HEAD`:
