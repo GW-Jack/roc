@@ -1024,6 +1024,16 @@ comptime {
     @export(&shimGetOps, .{ .name = shim_symbols.roc_shim_get_ops });
     @export(&shimEntrypoint, .{ .name = shim_symbols.roc_entrypoint });
     @export(&shimDefaultMain, .{ .name = shim_symbols.roc_shim_default_main });
+    // A `Tasks` platform's host drives the tasks its provides entries return.
+    // This archive links no builtins object (the program's builtins load
+    // with its image), so the shim is what defines the host's task calls in
+    // the binary (design.md "Host Contract"). The shim's unit tests link
+    // roc_builtins.o in place of the image, and it defines them there.
+    if (!builtin.is_test) {
+        @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
+        @export(&builtins.task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
+        @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+    }
 }
 
 fn shimGetOps() callconv(.c) *anyopaque {

@@ -2209,8 +2209,8 @@ fn requirePlatformTargets(ctx: *CliCtx, build_env: *const BuildEnv, app_path: []
 
 /// Reject a platform whose `concurrency` mode the chosen optimization level
 /// and lowering strategy do not support yet (design.md "What Implements It
-/// First"): `Tasks` runs under `.lss` on the interpreter, and on LLVM for a
-/// native `target`. Discovery read the mode from the platform header, so this
+/// First"): `Tasks` runs under `.lss` on the interpreter, and on the dev
+/// backend and LLVM for a native `target`. Discovery read the mode from the platform header, so this
 /// runs before any lowering.
 /// `ParallelTasks` is left to checking, which reports it as not yet
 /// implemented.
@@ -2240,25 +2240,28 @@ fn requireSupportedConcurrency(
 
 /// Whether a `concurrency: Tasks` program lowers with `opt` under `strategy`
 /// for `target` (null: this host). The continuation pass needs lambda-set
-/// specialization; the interpreter and LLVM implement the task runtime
-/// (design.md "Backends"), LLVM for native targets only so far.
+/// specialization; the interpreter, the dev backend and LLVM implement the
+/// task runtime (design.md "Backends"), dev and LLVM for native targets only
+/// so far.
 fn tasksLowers(opt: cli_args.OptLevel, strategy: base.SpecializationStrategy, target: ?RocTarget) bool {
     if (strategy != .lss) return false;
     return switch (opt) {
         .interpreter => true,
-        .speed, .size => if (target) |t| t.toCpuArch() != .wasm32 else true,
-        .dev => false,
+        .dev, .speed, .size => if (target) |t| t.toCpuArch() != .wasm32 else true,
     };
 }
 
-test "Tasks lowers with specialization on the interpreter and on LLVM for native targets" {
+test "Tasks lowers with specialization on the interpreter, and on dev and LLVM for native targets" {
     try std.testing.expect(tasksLowers(.interpreter, .lss, null));
     try std.testing.expect(tasksLowers(.speed, .lss, .arm64mac));
     try std.testing.expect(tasksLowers(.size, .lss, null));
     try std.testing.expect(!tasksLowers(.speed, .lss, .wasm32));
     try std.testing.expect(!tasksLowers(.speed, .boxy, null));
     try std.testing.expect(!tasksLowers(.interpreter, .boxy, null));
-    try std.testing.expect(!tasksLowers(.dev, .lss, null));
+    try std.testing.expect(tasksLowers(.dev, .lss, null));
+    try std.testing.expect(tasksLowers(.dev, .lss, .x64musl));
+    try std.testing.expect(!tasksLowers(.dev, .lss, .wasm32));
+    try std.testing.expect(!tasksLowers(.dev, .boxy, null));
 }
 
 /// The host inputs a shim run links for its selected target, copied out of

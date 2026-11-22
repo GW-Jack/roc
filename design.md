@@ -33807,9 +33807,9 @@ count:
   alignments as `U64` operands.
 
 The runtime's `RocTask` (`src/builtins/task.zig`) fixes where these live.
-The interpreter implements the operations against it. The other backends
-stop with a not-yet-implemented panic until they support `Tasks`, which the
-CLI already rejects for them.
+The interpreter, the dev backend and LLVM implement the operations against
+it. The wasm backend stops with a not-yet-implemented panic until it
+supports `Tasks`, which the CLI rejects for it.
 
 Resuming a task clears its pending flag and repeats, until the list is empty
 or the task pauses again: take the innermost record and call it with the
@@ -33887,9 +33887,10 @@ void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
 The builtins object exports `roc_task_resume`, `roc_task_wake` and
-`roc_task_free` (`RocTask.host_calls`), and the interpreter shim gets them
-by bundling that object, so it never exports them itself: a second
-definition would collide in the program's link. `roc_task_cancel` comes with the host
+`roc_task_free` (`RocTask.host_calls`). Each program binary defines them
+exactly once, since a second definition collides in the link: the
+interpreter shim gets them by bundling that object, and the machine-code
+shim, which links no builtins object, defines them itself (Backends). `roc_task_cancel` comes with the host
 ABI, since it calls the host's `roc_task_abort`, which a host that does not
 opt in never defines.
 
@@ -33979,7 +33980,11 @@ byte:
   links the builtins into the program privately, keeping only what the
   program itself defines, so a program that creates a task defines the three
   calls itself, each a call to its registry builtin
-  (`roc_builtins_task_resume`, `_wake`, `_free`).
+  (`roc_builtins_task_resume`, `_wake`, `_free`). A dev `roc run` loads
+  the program's builtins with its image, after the host is linked, so the
+  machine-code shim the host links defines the three calls instead. The
+  runtime keeps nothing outside the task that a second copy would split, so the shim's copy and the
+  image's agree on every task.
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
   that every backend declares the same way.
@@ -33989,17 +33994,17 @@ runner against a C-ABI version of the pausing test host, with the runner
 resolving the fixture's hosted symbols to that host, and its result,
 hosted-call trace and leak check match the interpreter's, including a
 cancel at each pause. The CLI stops rejecting `concurrency: Tasks` for that
-backend in the same change. The dev backend comes first, then LLVM, then
+backend in the same change. The dev backend and LLVM come first, then
 wasm.
 
 ### What Implements It First
 
 The first implementation supports `concurrency: Tasks` under `.lss` on the
-interpreter, then on LLVM for native targets (Backends). Until the rest
-exists:
+interpreter, then on LLVM and the dev backend for native targets (Backends).
+Until the rest exists:
 
-- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), on
-  the dev backend, or on LLVM for a wasm target, as an unsupported option
+- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
+  on the dev backend or LLVM for a wasm target, as an unsupported option
   combination. Discovery reads the mode from the platform header, and the
   CLI checks it against the selected target, so `roc run`, `roc build` and
   `roc test` report it before checking starts;

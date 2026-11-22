@@ -11,8 +11,8 @@
 //! test calls it as a host calls a `provides` entry and drives the task it
 //! returns.
 //!
-//! The same runs go through the LLVM backend, loaded in this process, with
-//! the host's C-ABI hosted functions (design.md "Backends").
+//! The same runs go through the LLVM and dev backends, loaded in this
+//! process, with the host's C-ABI hosted functions (design.md "Backends").
 
 const std = @import("std");
 const lir = @import("lir");
@@ -169,6 +169,82 @@ const LlvmRun = struct {
     }
 };
 
+/// The program compiled by the dev backend into this process, its hosted
+/// symbols bound to the test host's C-ABI functions.
+const DevProgram = struct {
+    lowered: *const lir.CheckedPipeline.LoweredProgram,
+    static_data: []static_data.StaticDataExport,
+    image: eval.InspectedRun.DevImage,
+
+    fn init(self: *DevProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) eval.InspectedRun.DevError!void {
+        self.lowered = lowered;
+        self.static_data = try harness.nativeStaticData(lowered);
+        errdefer harness.freeNativeStaticData(self.static_data);
+        const program = &lowered.lir_result;
+        const resolver_context: u8 = 0;
+        self.image = try eval.InspectedRun.DevImage.load(std.testing.allocator, .{
+            .store = &program.store,
+            .layouts = &program.layouts,
+            .erased_capture_prefix = program.erased_capture_prefix,
+            .main_proc = program.root_procs.items[0],
+            .static_data = self.static_data,
+            .static_data_value_count = program.static_data_values.items.len,
+        }, .{ .context = &resolver_context, .resolve = resolveHostedSymbol });
+    }
+
+    fn deinit(self: *DevProgram) void {
+        self.image.deinit();
+        harness.freeNativeStaticData(self.static_data);
+    }
+
+    fn resolveHostedSymbol(_: *const anyopaque, name: []const u8) ?usize {
+        return task_test_host.resolveCAbiSymbol(null, name);
+    }
+};
+
+/// One run of the dev-compiled program, in this process, set up as an LLVM
+/// run is.
+const DevRun = struct {
+    const Program = *const DevProgram;
+
+    runtime: eval.RuntimeHostEnv,
+    host: TestHost,
+    entered: builtins.in_process_host.Saved,
+
+    fn init(self: *DevRun, _: Program, mode: task_test_host.Mode) E2eError!void {
+        self.runtime = eval.RuntimeHostEnv.init(std.testing.allocator);
+        const ops = self.runtime.get_ops();
+        self.host = TestHost.init(std.testing.allocator, ops, mode);
+        self.entered = builtins.in_process_host.enter(ops, null);
+        self.host.enterCAbi();
+        task_test_host.c_abi_failure = null;
+    }
+
+    fn deinit(self: *DevRun) void {
+        self.host.leaveCAbi();
+        builtins.in_process_host.leave(self.entered);
+        self.host.deinit();
+        self.runtime.deinit();
+    }
+
+    /// Make the root's task by calling the compiled task entry
+    /// `E(url, result_out)` through its entrypoint wrapper.
+    fn startRoot(self: *DevRun, program: Program, result: *RocStr) E2eError!*RocTask {
+        const store = &program.lowered.lir_result.store;
+        const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
+        try std.testing.expectEqual(@import("layout").Idx.opaque_ptr, entry.ret_layout);
+        const ops = self.runtime.get_ops();
+        const url_str = RocStr.fromSlice(url, ops);
+        var entry_args = EntryArgs{ .url = url_str, .result_out = result };
+        var task: *RocTask = undefined;
+        program.image.entry()(@ptrCast(&task), @ptrCast(&entry_args));
+        if (task_test_host.c_abi_failure) |err| return err;
+        // A borrowed argument stays the caller's.
+        if ((entry.rc_borrowed_params & 1) != 0) url_str.decref(ops);
+        return task;
+    }
+};
+
 /// The task entry's arguments, laid out as the entrypoint ABI lays them out.
 const EntryArgs = extern struct { url: RocStr, result_out: *RocStr };
 
@@ -240,6 +316,19 @@ fn runAllLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerT
     };
 }
 
+fn runAllDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the Tasks program with the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    checkAll(DevRun, &program) catch |err| {
+        std.log.err("tasks end-to-end run on the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
 test "a Tasks program pauses at every suspending call and gives the same result with no leaks" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAll);
@@ -248,4 +337,10 @@ test "a Tasks program pauses at every suspending call and gives the same result 
 test "a Tasks program compiled by LLVM pauses and cancels as it does on the interpreter, with no leaks" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllLlvm);
+}
+
+test "a Tasks program compiled by the dev backend pauses and cancels as it does on the interpreter, with no leaks" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllDev);
 }

@@ -1186,7 +1186,9 @@ fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytyp
     try report.document.addAnnotated("--specialize=yes", .emphasized);
     try report.document.addText(") on the interpreter (");
     try report.document.addAnnotated("--opt=interpreter", .emphasized);
-    try report.document.addText(") or, for a native target, on LLVM (");
+    try report.document.addText(") or, for a native target, on the dev backend (");
+    try report.document.addAnnotated("--opt=dev", .emphasized);
+    try report.document.addText(") or LLVM (");
     try report.document.addAnnotated("--opt=speed", .emphasized);
     try report.document.addText(" or ");
     try report.document.addAnnotated("--opt=size", .emphasized);
@@ -1859,12 +1861,12 @@ test "unsupported_opt_level generates correct report" {
 test "unsupported_concurrency_lowering names the supported options" {
     const rendered = try renderPlainForTest(.{ .unsupported_concurrency_lowering = .{
         .mode = "Tasks",
-        .opt = "dev",
+        .opt = "speed",
         .specialize = "no",
     } });
     defer std.testing.allocator.free(rendered);
     // The report wraps its lines, so each needle fits within one.
-    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=dev", "--specialize=no", "--opt=interpreter", "--specialize=yes", "--opt=speed", "--opt=size" }) |needle| {
+    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=speed --specialize=no", "--specialize=yes", "--opt=interpreter", "--opt=dev", "--opt=size" }) |needle| {
         try std.testing.expect(std.mem.find(u8, rendered, needle) != null);
     }
 }

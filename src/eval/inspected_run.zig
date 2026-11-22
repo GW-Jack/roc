@@ -136,7 +136,8 @@ const InterpreterError = Allocator.Error || error{
     UnsupportedHostedFunction,
 };
 
-const DevError = Allocator.Error || error{
+/// Why compiling, loading or running a program with the dev backend fails.
+pub const DevError = Allocator.Error || error{
     DevBackendUnavailable,
     EmptyCode,
     Internal,
@@ -349,22 +350,40 @@ fn runInterpreter(allocator: Allocator, program: Program, execution_host: Execut
     ));
 }
 
-fn runDev(allocator: Allocator, program: Program) DevError!Result {
-    if (comptime !backend.host_lir_codegen_available) {
-        return error.DevBackendUnavailable;
-    } else {
+/// A program the dev backend compiled into this process's executable memory,
+/// with its static data, entered at `roc_eval_main` with `(ret, args)`.
+pub const DevImage = struct {
+    /// The string literals the compiled code points into.
+    static_strings: backend.StaticStringData.Table,
+    static_image: backend.StaticDataImage,
+    executable: ExecutableMemory,
+    /// The main procedure's argument layouts, in the order its entry reads them.
+    arg_layouts: []LayoutIdx,
+    allocator: Allocator,
+
+    /// The entrypoint ABI of `roc_eval_main`.
+    pub const EntryFn = *const fn ([*]u8, ?*anyopaque) callconv(.c) void;
+
+    /// Compile `program` with the dev backend into executable memory.
+    /// `hosted_symbols` gives the addresses of the program's hosted
+    /// functions, such as a test host's C-ABI functions.
+    pub fn load(allocator: Allocator, program: Program, hosted_symbols: ?backend.dev.LirCodeGenMod.HostedSymbolResolver) DevError!DevImage {
+        if (comptime !backend.host_lir_codegen_available) return error.DevBackendUnavailable else return loadAvailable(allocator, program, hosted_symbols);
+    }
+
+    fn loadAvailable(allocator: Allocator, program: Program, hosted_symbols: ?backend.dev.LirCodeGenMod.HostedSymbolResolver) DevError!DevImage {
         var static_strings = try backend.StaticStringData.build(
             allocator,
             program.store,
             backend.dev.LirCodeGenMod.host_lir_codegen_target,
         );
-        defer static_strings.deinit();
+        errdefer static_strings.deinit();
 
         var static_image = backend.StaticDataImage.init(allocator, program.static_data) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Internal,
         };
-        defer static_image.deinit();
+        errdefer static_image.deinit();
         const addresses = static_image.lirValueAddresses(allocator, program.static_data_value_count) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Internal,
@@ -381,6 +400,7 @@ fn runDev(allocator: Allocator, program: Program) DevError!Result {
         );
         defer codegen.deinit();
         codegen.setNativeStaticData(addresses);
+        codegen.setHostedSymbolResolver(hosted_symbols);
         try codegen.compileAllProcSpecs(program.store.getProcSpecs());
         const helpers = try backend.collectRequiredRcHelpers(allocator, program.static_data);
         defer allocator.free(helpers);
@@ -388,7 +408,7 @@ fn runDev(allocator: Allocator, program: Program) DevError!Result {
 
         const proc = program.store.getProcSpec(program.main_proc);
         const arg_layouts = try mainProcArgLayouts(allocator, program.store, program.main_proc);
-        defer allocator.free(arg_layouts);
+        errdefer allocator.free(arg_layouts);
         const entrypoint = try codegen.generateEntrypointWrapper(
             "roc_eval_main",
             program.main_proc,
@@ -396,12 +416,12 @@ fn runDev(allocator: Allocator, program: Program) DevError!Result {
             proc.ret_layout,
         );
         try codegen.finishImage();
-        var exec_mem = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
+        var executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
             codegen.getGeneratedCode(),
             entrypoint.offset,
             codegen.getUnwindFunctions(),
         );
-        defer exec_mem.deinit();
+        errdefer executable.deinit();
         const Resolver = struct {
             codegen: *const HostLirCodeGen,
             executable: *const ExecutableMemory,
@@ -413,47 +433,68 @@ fn runDev(allocator: Allocator, program: Program) DevError!Result {
                 return address + (self.codegen.compiledProcSymbol(proc_id) orelse return null).code_start;
             }
         };
-        var resolver = Resolver{ .codegen = &codegen, .executable = &exec_mem };
+        var resolver = Resolver{ .codegen = &codegen, .executable = &executable };
         static_image.resolveFunctionRelocations(.{ .context = &resolver, .resolve = Resolver.resolve }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Internal,
         };
-
-        var runtime_env = RuntimeHostEnv.init(allocator);
-        defer runtime_env.deinit();
-
-        const arg_buffer = try zeroedEntrypointArgBuffer(allocator, program.layouts, arg_layouts);
-        defer if (arg_buffer) |buf| allocator.free(buf);
-
-        const ret_layout = proc.ret_layout;
-        const size_align = program.layouts.layoutSizeAlign(program.layouts.getLayout(ret_layout));
-        const ret_buf = try allocator.alignedAlloc(u8, collections.max_roc_alignment, @max(size_align.size, 1));
-        defer allocator.free(ret_buf);
-        @memset(ret_buf, 0);
-
-        var crash_boundary = runtime_env.enterCrashBoundary();
-        defer crash_boundary.deinit();
-        const entered = builtins.in_process_host.enter(runtime_env.get_ops(), null);
-        defer builtins.in_process_host.leave(entered);
-        var root_call: EntryCall = .{
-            .entry = @ptrCast(@alignCast(exec_mem.entryPtr())),
-            .ret = ret_buf.ptr,
-            .args = if (arg_buffer) |buf| @ptrCast(buf.ptr) else null,
-        };
-        if (try crash_boundary.run(EntryCall, &root_call, EntryCall.call) != 0) return crashResult(allocator, &runtime_env, null);
-        switch (runtime_env.crashState()) {
-            .did_not_crash => {},
-            .crashed => return crashResult(allocator, &runtime_env, null),
-        }
-
-        return returnedResult(allocator, &runtime_env, try copyReturnedRocStr(
-            allocator,
-            program.layouts,
-            ret_layout,
-            ret_buf.ptr,
-            runtime_env.get_ops(),
-        ));
+        return .{ .static_strings = static_strings, .static_image = static_image, .executable = executable, .arg_layouts = arg_layouts, .allocator = allocator };
     }
+
+    /// Free the program's code, static data and string literals.
+    pub fn deinit(self: *DevImage) void {
+        self.executable.deinit();
+        self.static_image.deinit();
+        self.static_strings.deinit();
+        self.allocator.free(self.arg_layouts);
+    }
+
+    /// The compiled program's entry.
+    pub fn entry(self: *const DevImage) EntryFn {
+        return @ptrCast(@alignCast(self.executable.entryPtr()));
+    }
+};
+
+fn runDev(allocator: Allocator, program: Program) DevError!Result {
+    var image = try DevImage.load(allocator, program, null);
+    defer image.deinit();
+    const arg_layouts = image.arg_layouts;
+    const proc = program.store.getProcSpec(program.main_proc);
+
+    var runtime_env = RuntimeHostEnv.init(allocator);
+    defer runtime_env.deinit();
+
+    const arg_buffer = try zeroedEntrypointArgBuffer(allocator, program.layouts, arg_layouts);
+    defer if (arg_buffer) |buf| allocator.free(buf);
+
+    const ret_layout = proc.ret_layout;
+    const size_align = program.layouts.layoutSizeAlign(program.layouts.getLayout(ret_layout));
+    const ret_buf = try allocator.alignedAlloc(u8, collections.max_roc_alignment, @max(size_align.size, 1));
+    defer allocator.free(ret_buf);
+    @memset(ret_buf, 0);
+
+    var crash_boundary = runtime_env.enterCrashBoundary();
+    defer crash_boundary.deinit();
+    const entered = builtins.in_process_host.enter(runtime_env.get_ops(), null);
+    defer builtins.in_process_host.leave(entered);
+    var root_call: EntryCall = .{
+        .entry = image.entry(),
+        .ret = ret_buf.ptr,
+        .args = if (arg_buffer) |buf| @ptrCast(buf.ptr) else null,
+    };
+    if (try crash_boundary.run(EntryCall, &root_call, EntryCall.call) != 0) return crashResult(allocator, &runtime_env, null);
+    switch (runtime_env.crashState()) {
+        .did_not_crash => {},
+        .crashed => return crashResult(allocator, &runtime_env, null),
+    }
+
+    return returnedResult(allocator, &runtime_env, try copyReturnedRocStr(
+        allocator,
+        program.layouts,
+        ret_layout,
+        ret_buf.ptr,
+        runtime_env.get_ops(),
+    ));
 }
 
 fn runWasm(allocator: Allocator, program: Program) WasmError!Result {
