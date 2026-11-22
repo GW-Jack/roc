@@ -18,19 +18,23 @@ const CFStmtId = LIR.CFStmtId;
 const LowLevel = lir.LowLevel;
 const RocTask = builtins.task.RocTask;
 
-const TaskOpsTestError = Allocator.Error || eval.Interpreter.Error || RuntimeHostEnv.LeakError || error{
+/// The errors these tests' helpers return.
+pub const TaskOpsTestError = Allocator.Error || eval.Interpreter.Error || RuntimeHostEnv.LeakError || error{
     TestExpectedEqual,
     TestUnexpectedResult,
 };
 
-const Fixture = struct {
+/// A LIR store and layouts to build a program in, and the runtime host
+/// whose allocations the tests check for leaks.
+pub const Fixture = struct {
     allocator: Allocator,
     store: LirStore,
     layouts: layout.Store,
     runtime_env: RuntimeHostEnv,
     locals: std.ArrayList(LocalId) = .empty,
 
-    fn init(allocator: Allocator) TaskOpsTestError!Fixture {
+    /// An empty program.
+    pub fn init(allocator: Allocator) TaskOpsTestError!Fixture {
         var store = LirStore.init(allocator);
         errdefer store.deinit();
         return .{
@@ -41,7 +45,8 @@ const Fixture = struct {
         };
     }
 
-    fn deinit(self: *Fixture) void {
+    /// Release the program and the runtime host.
+    pub fn deinit(self: *Fixture) void {
         self.locals.deinit(self.allocator);
         self.runtime_env.deinit();
         self.layouts.deinit();
@@ -190,7 +195,7 @@ const PausingHost = struct {
 /// result of `hosted_ret`, after the continuation pass: the provides root
 /// `g(x) = t = h(x); ret (if add then t + x else x)`. Returns the task entry
 /// that takes `g`'s place among the roots.
-fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTestError!LIR.LirProcSpecId {
+pub fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTestError!LIR.LirProcSpecId {
     const allocator = f.allocator;
     const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
     const h = try f.store.addProcSpec(.{
@@ -331,12 +336,15 @@ test "cancelling a task the host has not finished aborts the host call and relea
     try f.runtime_env.checkForLeaks();
 }
 
-var aborted: ?*RocTask = null;
+/// The task the last `abortRecord` call aborted.
+pub var aborted: ?*RocTask = null;
 
-fn abortRecord(task: *RocTask) callconv(.c) void {
+/// A host's abort callback that records the task it was given.
+pub fn abortRecord(task: *RocTask) callconv(.c) void {
     aborted = task;
 }
 
-fn abortUnexpected(_: *RocTask) callconv(.c) void {
+/// A host's abort callback for a cancel that must not abort a host call.
+pub fn abortUnexpected(_: *RocTask) callconv(.c) void {
     std.debug.panic("a woken task's cancel aborted the host call", .{});
 }

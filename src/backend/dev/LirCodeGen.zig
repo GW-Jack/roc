@@ -378,6 +378,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
     const str_bytes_offset: i32 = @intCast(RocStr.targetFieldOffset(.bytes, target_ptr_size));
     const str_capacity_offset: i32 = @intCast(RocStr.targetFieldOffset(.capacity_or_alloc_ptr, target_ptr_size));
     const str_len_offset: i32 = @intCast(RocStr.targetFieldOffset(.length, target_ptr_size));
+    // Where the `task_*` low-level operations find the task's fields.
+    const task_offsets = struct {
+        const fields = builtins.task.FieldOffsets.forPointerSize(target_ptr_size);
+        const pending: i32 = @intCast(fields.pending);
+        const hosted_slot: i32 = @intCast(fields.hosted_slot);
+        const result_buffer: i32 = @intCast(fields.result_buffer);
+    };
     // The small-string flag byte is the high byte of the length word.
     const str_flag_byte_offset: i32 = @intCast(RocStr.targetFlagByteOffset(target_ptr_size));
     const str_flag_byte_shift: u8 = @intCast((str_flag_byte_offset - str_len_offset) * 8);
@@ -4990,7 +4997,49 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         return .{ .stack = .{ .offset = result_offset, .size = ValueSize.fromByteCount(elem_size) } };
                     }
                 },
-                .task_ready, .task_set_pending, .task_hosted_slot, .task_result_buffer, .task_create => @panic("TODO: task operations are not implemented in the dev backend"),
+                // The task's three reachable fields sit at the offsets
+                // task.zig names (design.md "Backends").
+                .task_ready => {
+                    expectArgCount(ll.op, args, 1);
+                    const task_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 0)));
+                    const result_reg = try self.allocTempGeneral();
+                    try self.emitSizedLoadMem(result_reg, task_reg, task_offsets.pending, .byte);
+                    try self.emitCmpImm(result_reg, 0);
+                    try self.emitSetCond(result_reg, condCode(.equal));
+                    self.codegen.freeGeneral(task_reg);
+                    return .{ .general_reg = result_reg };
+                },
+                .task_set_pending => {
+                    expectArgCount(ll.op, args, 1);
+                    const task_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 0)));
+                    const one_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(one_reg, 1);
+                    try self.emitSizedStoreMem(task_reg, task_offsets.pending, one_reg, .byte);
+                    self.freeGenerals(.{ one_reg, task_reg });
+                    return .{ .immediate_i64 = 0 };
+                },
+                .task_hosted_slot, .task_result_buffer => {
+                    expectArgCount(ll.op, args, 1);
+                    const task_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 0)));
+                    const result_reg = try self.allocTempGeneral();
+                    const offset = if (ll.op == .task_hosted_slot) task_offsets.hosted_slot else task_offsets.result_buffer;
+                    try self.emitLoad(.w64, result_reg, task_reg, offset);
+                    self.codegen.freeGeneral(task_reg);
+                    return .{ .general_reg = result_reg };
+                },
+                .task_create => {
+                    // (start, root_result, slot size, slot alignment, buffer
+                    // size, buffer alignment), passed to the builtin in order.
+                    expectArgCount(ll.op, args, 6);
+                    const locs = try self.emitValueLocals(6, args);
+                    var offsets: [6]i32 = undefined;
+                    for (locs, &offsets) |loc, *offset| offset.* = try self.ensureOnStack(loc, 8);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    for (offsets) |offset| try builder.addMemArg(frame_ptr, offset);
+                    try self.callBuiltin(&builder, .task_create);
+                    return try self.scalarRetReg();
+                },
                 .ptr_cast => {
                     // ptr_cast: identity bits (box(T) -> ptr(T) or ptr -> ptr).
                     const loc = try self.emitValueLocal(GuardedList.at(args, 0));
@@ -13754,7 +13803,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     base.invariant(
                         "LIR/codegen invariant violated: assign_struct target local {d} layout {d} ({s}) is not runtime struct or zst layout; proc={d} stmt={d}",
                         .{
-                            @backingInt(s.target),
+                            // A record's capture is built with no target local.
+                            if (@hasField(@TypeOf(s), "target")) @backingInt(s.target) else std.math.maxInt(u32),
                             @backingInt(s.target_layout),
                             @tagName(target_layout.tag),
                             if (self.current_proc_name) |name| name.raw() else std.math.maxInt(u64),
@@ -14567,11 +14617,36 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (skip_patch) |patch| try self.codegen.patchJump(patch, self.codegen.currentOffset());
         }
 
+        /// Where a packed erased callable's capture comes from: a local, or a
+        /// value already built, as a `suspend_save` record's struct of saved
+        /// values is.
+        const PackedCapture = union(enum) {
+            none,
+            local: LocalId,
+            value: ValueLocation,
+        };
+
+        /// The capture's value, at `layout_idx`.
+        fn packedCaptureLocation(self: *Self, capture: PackedCapture, layout_idx: layout.Idx) Allocator.Error!ValueLocation {
+            return switch (capture) {
+                .none => unreachable, // callers ask only for a present capture, which the presence check pairs with its layout
+                .local => |capture_local| self.requireExactValueLocationToLayout(
+                    try self.emitValueLocal(capture_local),
+                    self.localLayout(capture_local),
+                    layout_idx,
+                    "packed_erased_fn.capture",
+                ),
+                .value => |loc| loc,
+            };
+        }
+
         fn generatePackedErasedFn(
             self: *Self,
             proc_id: lir.LIR.LirProcSpecId,
-            capture: ?LocalId,
-            target_layout: layout.Idx,
+            capture: PackedCapture,
+            /// The target local's layout, or null for a `suspend_save` record,
+            /// which has no target.
+            target_layout: ?layout.Idx,
             capture_layout: ?layout.Idx,
             on_drop: lir.LIR.ErasedCallableOnDrop,
             on_copy: lir.LIR.ErasedCallableOnDrop,
@@ -14581,14 +14656,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             frame_slot: ?i32,
         ) Allocator.Error!ValueLocation {
             const frame = frame_slot != null;
-            const target_layout_val = self.layout_store.getLayout(target_layout);
-            if (builtin.mode == .debug and target_layout_val.tag != .erased_callable) {
-                base.invariant(
-                    "Dev/codegen invariant violated: packed erased fn target layout must be erased_callable, got {s}",
-                    .{@tagName(target_layout_val.tag)},
-                );
+            if (target_layout) |target_layout_idx| {
+                const target_layout_val = self.layout_store.getLayout(target_layout_idx);
+                if (builtin.mode == .debug and target_layout_val.tag != .erased_callable) {
+                    base.invariant(
+                        "Dev/codegen invariant violated: packed erased fn target layout must be erased_callable, got {s}",
+                        .{@tagName(target_layout_val.tag)},
+                    );
+                }
             }
-            if ((capture != null) != (capture_layout != null)) {
+            if ((capture != .none) != (capture_layout != null)) {
                 base.invariant("Dev/codegen invariant violated: packed erased fn capture/layout presence differed", .{});
             }
 
@@ -14644,15 +14721,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     self.codegen.freeGeneral(original_on_copy_reg);
                 }
 
-                if (capture) |capture_local| {
+                if (capture != .none) {
                     const layout_idx = capture_layout orelse unreachable; // the presence check at the top of generatePackedErasedFn pairs capture with capture_layout
                     if (capture_size > 0) {
-                        const capture_loc = self.requireExactValueLocationToLayout(
-                            try self.emitValueLocal(capture_local),
-                            self.localLayout(capture_local),
-                            layout_idx,
-                            "packed_erased_fn.capture",
-                        );
+                        const capture_loc = try self.packedCaptureLocation(capture, layout_idx);
                         const capture_stack = try self.ensureOnStack(capture_loc, capture_size);
                         const temp = try self.allocTempGeneral();
                         try self.copyChunked(
@@ -14809,14 +14881,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             try self.writeErasedCaptureMetadata(heap_ptr, base_capture_size, on_copy);
-            if (capture) |capture_local| {
+            if (capture != .none) {
                 const layout_idx = capture_layout orelse unreachable; // the presence check at the top of generatePackedErasedFn pairs capture with capture_layout
-                const capture_loc = self.requireExactValueLocationToLayout(
-                    try self.emitValueLocal(capture_local),
-                    self.localLayout(capture_local),
-                    layout_idx,
-                    "packed_erased_fn.capture",
-                );
+                const capture_loc = try self.packedCaptureLocation(capture, layout_idx);
                 if (capture_size > 0) {
                     const capture_stack = try self.ensureOnStack(capture_loc, capture_size);
                     const temp = try self.allocTempGeneral();
@@ -21227,7 +21294,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             const assign = self.store.stmtRow(assign_stmt.data);
                             const value_loc = try self.generatePackedErasedFn(
                                 assign.proc,
-                                assign.capture,
+                                if (assign.capture) |capture_local| .{ .local = capture_local } else .none,
                                 self.localLayout(assign_stmt.target),
                                 assign.capture_layout,
                                 assign.on_drop,
@@ -21405,9 +21472,51 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             try self.emitTrap();
                         },
 
-                        // Milestone 1 implements suspension on the interpreter only
-                        // (design.md "What Implements It First").
-                        .suspend_save, .suspend_return => @panic("TODO: the dev backend does not implement suspension yet"),
+                        // design.md "Backends": the record is a heap-packed
+                        // erased callable of the resume entry over the saved
+                        // values, and the task's list takes its reference.
+                        .suspend_save => |save_stmt| {
+                            const save = self.store.stmtRow(save_stmt.data);
+                            const capture_size = self.getLayoutSize(save.capture_layout);
+                            const capture: PackedCapture = if (capture_size == 0) .none else .{ .value = try self.generateStruct(.{
+                                .fields = save.saved,
+                                .target_layout = save.capture_layout,
+                            }) };
+                            const record_loc = try self.generatePackedErasedFn(
+                                save.proc,
+                                capture,
+                                null,
+                                if (capture_size == 0) null else save.capture_layout,
+                                save.on_drop,
+                                .none,
+                                null,
+                                false,
+                                null,
+                            );
+                            const record_slot = try self.ensureOnStack(record_loc, 8);
+                            const task_slot = try self.ensureOnStack(try self.emitValueLocal(save_stmt.task), 8);
+                            // The slot release is the hosted result's host-drop
+                            // adapter, as a capture's `on_drop` is: it takes
+                            // the slot first and ignores what follows.
+                            const slot_drop_reg = try self.materializeErasedCallableOnDrop(save.slot_drop);
+                            const slot_drop_slot = self.codegen.allocStackSlot(8);
+                            try self.emitStore(.w64, frame_ptr, slot_drop_slot, slot_drop_reg);
+                            self.codegen.freeGeneral(slot_drop_reg);
+                            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                            defer builder.deinit();
+                            try builder.addMemArg(frame_ptr, task_slot);
+                            try builder.addMemArg(frame_ptr, record_slot);
+                            try builder.addMemArg(frame_ptr, slot_drop_slot);
+                            try self.callBuiltin(&builder, .task_push_record);
+                            try work.append(wa, .{ .node = save_stmt.next });
+                        },
+                        // Returns without writing a result: nothing reads one
+                        // before its caller tests `task_ready`.
+                        .suspend_return => {
+                            try self.emitFreeCarry();
+                            const patch = try self.codegen.emitJump();
+                            try self.early_return_patches.append(self.allocator, patch);
+                        },
                         .runtime_error => {
                             try self.emitRocCrash("hit a runtime error");
                             try self.emitTrap();
