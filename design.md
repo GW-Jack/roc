@@ -34051,7 +34051,11 @@ Tests establish the rest. The same program runs against a host that finishes
 every suspending call at once and a host that pauses at every one, and must
 give the same result, the same hosted-call trace and no live allocations
 afterwards; cancelling at each site in turn must also leave no live
-allocations. A program built for a platform that marks its hosted functions
+allocations. The `test/concurrency-tasks` platform's native host is such a
+pausing host. It parks every `fetch!`, finishes it on the next turn of its
+loop, and fails the run unless every allocation it served was freed, so
+`roc run` runs that program through the CLI against it, on every backend
+that supports `Tasks`. A program built for a platform that marks its hosted functions
 `suspending` must give the LIR it gets without the marks, apart from the
 task arguments, the hosted calls' new shape, the pending tests and edges,
 and the continuations and resume entries. A Python model of the design

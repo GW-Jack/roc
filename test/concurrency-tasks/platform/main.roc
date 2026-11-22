@@ -11,8 +11,10 @@ platform ""
     concurrency: Tasks
     targets: {
         inputs_dir: "targets/",
-        arm64mac: { inputs: ["libhost.a", app], output: Shared },
-        x64musl: { inputs: ["libhost.a", app], output: Shared },
+        x64mac: { inputs: ["libhost.a", app] },
+        arm64mac: { inputs: ["libhost.a", app] },
+        x64musl: { inputs: ["rcrt1.o", "libhost.a", app, "libc.a"] },
+        arm64musl: { inputs: ["rcrt1.o", "libhost.a", app, "libc.a"] },
     }
 
 import Host
