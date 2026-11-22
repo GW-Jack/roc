@@ -1182,9 +1182,15 @@ fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytyp
 
     try report.document.addText("For now, a platform with ");
     try report.document.addAnnotated("concurrency: Tasks", .emphasized);
-    try report.document.addText(" runs only on the interpreter with lambda-set specialization: use ");
-    try report.document.addAnnotated("--opt=interpreter --specialize=yes", .emphasized);
-    try report.document.addText(".");
+    try report.document.addText(" needs lambda-set specialization (");
+    try report.document.addAnnotated("--specialize=yes", .emphasized);
+    try report.document.addText(") on the interpreter (");
+    try report.document.addAnnotated("--opt=interpreter", .emphasized);
+    try report.document.addText(") or, for a native target, on LLVM (");
+    try report.document.addAnnotated("--opt=speed", .emphasized);
+    try report.document.addText(" or ");
+    try report.document.addAnnotated("--opt=size", .emphasized);
+    try report.document.addText(").");
 
     return report;
 }
@@ -1858,7 +1864,7 @@ test "unsupported_concurrency_lowering names the supported options" {
     } });
     defer std.testing.allocator.free(rendered);
     // The report wraps its lines, so each needle fits within one.
-    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=dev", "--specialize=no", "--opt=interpreter", "--specialize=yes" }) |needle| {
+    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=dev", "--specialize=no", "--opt=interpreter", "--specialize=yes", "--opt=speed", "--opt=size" }) |needle| {
         try std.testing.expect(std.mem.find(u8, rendered, needle) != null);
     }
 }

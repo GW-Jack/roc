@@ -227,6 +227,13 @@ fn runAllLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerT
         return error.TestUnexpectedResult;
     };
     defer program.deinit();
+    // A host links its task calls from the program it runs.
+    for ([_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_wake, builtins.shim_symbols.roc_task_free }) |name| {
+        if (program.image.lib.lookup(*const anyopaque, name) == null) {
+            std.log.err("the LLVM-compiled Tasks program does not export {s}", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
     checkAll(LlvmRun, &program) catch |err| {
         std.log.err("tasks end-to-end run on LLVM failed: {s}", .{@errorName(err)});
         return error.TestUnexpectedResult;

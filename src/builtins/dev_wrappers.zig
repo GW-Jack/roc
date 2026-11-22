@@ -1418,6 +1418,23 @@ pub fn roc_builtins_task_push_record(roc_task: *task.RocTask, record: [*]u8, slo
     roc_task.pushRecord(record, slot_drop);
 }
 
+/// `roc_task_resume` under its builtin name, for a backend that links the
+/// builtins privately and defines the host's task calls in the program
+/// (design.md "Backends").
+pub fn roc_builtins_task_resume(roc_task: *task.RocTask) callconv(.c) u32 {
+    return task.host_calls.resumeTask(roc_task);
+}
+
+/// `roc_task_wake` under its builtin name; see `roc_builtins_task_resume`.
+pub fn roc_builtins_task_wake(roc_task: *task.RocTask) callconv(.c) void {
+    task.host_calls.wake(roc_task);
+}
+
+/// `roc_task_free` under its builtin name; see `roc_builtins_task_resume`.
+pub fn roc_builtins_task_free(roc_task: *task.RocTask) callconv(.c) void {
+    task.host_calls.free(roc_task);
+}
+
 /// Enter the loaded dev-shim code image that contains the generated callsite.
 pub fn roc_builtins_hot_reload_enter() callconv(.c) ?*anyopaque {
     if (comptime @hasDecl(@import("root"), "roc_hot_reload_enter")) {

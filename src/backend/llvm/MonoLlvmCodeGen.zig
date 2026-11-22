@@ -407,6 +407,9 @@ pub const MonoLlvmCodeGen = struct {
     /// The slot-release adapters `suspend_save` hands the task runtime, one
     /// per hosted result layout, compiled with the cold shims.
     slot_drop_adapters: std.ArrayList(SlotDropAdapter) = .empty,
+    /// Whether the module creates a task, and so defines the host's task
+    /// calls for the host.
+    defines_task_host_calls: bool = false,
     /// How many enclosing cold switch arms the statement being emitted sits
     /// under. Non-zero routes builtin calls through preserve_most shims.
     cold_depth: u32 = 0,
@@ -822,6 +825,7 @@ pub const MonoLlvmCodeGen = struct {
         self.symbol_functions.clearRetainingCapacity();
         self.cold_shims = @splat(null);
         self.slot_drop_adapters.clearRetainingCapacity();
+        self.defines_task_host_calls = false;
         self.cold_depth = 0;
         self.clearStaticBytes();
         self.static_refcounted_backings.clearRetainingCapacity();
@@ -1154,6 +1158,7 @@ pub const MonoLlvmCodeGen = struct {
         try self.compilePendingRcHelpers();
         try self.compilePendingColdShims();
         try self.compilePendingSlotDropAdapters();
+        if (self.defines_task_host_calls) try self.defineTaskHostCalls();
 
         for (entrypoints) |entrypoint| {
             try self.generateEntrypointWrapper(
@@ -5444,6 +5449,37 @@ pub const MonoLlvmCodeGen = struct {
         for (values[2..], 2..) |*value, i| value.* = try self.loadLocalScalar(GuardedList.at(args, i), .u64);
         const task = try self.callBuiltin(.task_create, ptr_ty, &.{ ptr_ty, ptr_ty, .i64, .i64, .i64, .i64 }, &values);
         try self.storePointer(self.slot(target).ptr, task);
+        self.defines_task_host_calls = true;
+    }
+
+    /// Define the host's task calls, which a program that creates a task
+    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_wake` and
+    /// `roc_task_free`, each a call to its builtin. Linking the builtins keeps
+    /// only what the program defines, so the program defines these for the
+    /// host. Runs after the procs, when no function is mid-emission.
+    fn defineTaskHostCalls(self: *MonoLlvmCodeGen) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const ptr_ty = try self.ptrType();
+        const calls = [_]struct { name: []const u8, builtin: BuiltinSymbol, ret: LlvmBuilder.Type }{
+            .{ .name = builtins.shim_symbols.roc_task_resume, .builtin = .task_resume, .ret = .i32 },
+            .{ .name = builtins.shim_symbols.roc_task_wake, .builtin = .task_wake, .ret = .void },
+            .{ .name = builtins.shim_symbols.roc_task_free, .builtin = .task_free, .ret = .void },
+        };
+        for (calls) |call| {
+            const target = try self.declareBuiltin(call.builtin, call.ret, &.{ptr_ty});
+            const fn_ty = builder.fnType(call.ret, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
+            const func = builder.addFunction(fn_ty, builder.strtabString(call.name) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
+            var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
+            defer wip.deinit();
+            wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
+            const result = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), &.{wip.arg(0)}, "") catch return error.OutOfMemory;
+            if (call.ret == .void) {
+                _ = wip.retVoid() catch return error.OutOfMemory;
+            } else {
+                _ = wip.ret(result) catch return error.OutOfMemory;
+            }
+            wip.finish() catch return error.OutOfMemory;
+        }
     }
 
     /// The adapter `suspend_save` hands the task runtime for a hosted result

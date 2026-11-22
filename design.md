@@ -33975,7 +33975,11 @@ byte:
 - **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`,
   `roc_task_wake` and `roc_task_free` from the builtins object linked into
   it, so every backend links the same symbols. The interpreter shim bundles
-  the same object, so the interpreter's host gets them the same way.
+  the same object, so the interpreter's host gets them the same way. LLVM
+  links the builtins into the program privately, keeping only what the
+  program itself defines, so a program that creates a task defines the three
+  calls itself, each a call to its registry builtin
+  (`roc_builtins_task_resume`, `_wake`, `_free`).
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
   that every backend declares the same way.
@@ -33991,12 +33995,14 @@ wasm.
 ### What Implements It First
 
 The first implementation supports `concurrency: Tasks` under `.lss` on the
-interpreter. Until the rest exists:
+interpreter, then on LLVM for native targets (Backends). Until the rest
+exists:
 
-- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
-  with any backend other than the interpreter, as an unsupported option
-  combination. Discovery reads the mode from the platform header, so
-  `roc run`, `roc build` and `roc test` report it before checking starts;
+- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), on
+  the dev backend, or on LLVM for a wasm target, as an unsupported option
+  combination. Discovery reads the mode from the platform header, and the
+  CLI checks it against the selected target, so `roc run`, `roc build` and
+  `roc test` report it before checking starts;
 - checking reports `concurrency: ParallelTasks` as not yet implemented;
 - the continuation pass stops with a not-yet-implemented panic, in every
   build mode, when an erased-callable procedure other than a resume entry or
